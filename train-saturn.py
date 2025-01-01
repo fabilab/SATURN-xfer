@@ -200,6 +200,11 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
 
             batch_loss = 0
             for species in np.random.choice(sorted_species_names, size=len(sorted_species_names), replace=False):
+                # NOTE: added by @iosonofabio, this seems to be the intent from 3 lines below
+                # FIXME: this seems to create problems...
+                if species not in batch_dict:
+                    continue
+
                 (data, labels, refs, batch_labels) = batch_dict[species]
                 
                 if data is None:
@@ -241,7 +246,6 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
                 epoch_ave_losses[species].append(float(spec_loss.detach().cpu()))
                 batch_loss += spec_loss
             
-            
             l1_loss = model.l1_penalty * model.lasso_loss(model.p_weights.exp())
             rank_loss = model.pe_sim_penalty * model.gene_weight_ranking_loss(model.p_weights.exp(), embeddings_tensor)
            
@@ -265,7 +269,7 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
     return model
 
 
-def get_all_embeddings(dataset, model, device, use_batch_labels=False):
+def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names=None):
     '''
     Get the embeddings and other metadata for a pretraining model.
 
@@ -273,10 +277,14 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False):
     model -- the pretrain model, class is saturnPretrainModel
     dataset -- count values
     use_batch_labels -- if we add batch labels as a categorical covariate
+    obs_names: sanity check argument to verify the order of cells is correct  # FIXME: added by @iosonofabio
     '''
-    test_loader = torch.utils.data.DataLoader(dataset, collate_fn=multi_species_collate_fn,
-                                        batch_size=1024, shuffle=False)
-
+    test_loader = torch.utils.data.DataLoader(
+        dataset,
+        collate_fn=multi_species_collate_fn,
+        batch_size=1024,
+        shuffle=False,
+    )
     model.eval()
     embs = []
     macrogenes = []
@@ -313,6 +321,7 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False):
                 
                 if use_batch_labels:
                     batch_labs = batch_labs + list(batch_labels.cpu().numpy())
+
     if use_batch_labels:
         return torch.stack(embs).cpu().numpy(), np.array(labs), np.array(spec), torch.stack(macrogenes),\
                                                                 np.array(refs), np.array(batch_labs)
@@ -430,10 +439,14 @@ def trainer(args):
         species_to_label = data_df.to_dict()["in_label_col"]
         species_to_label_col = {species:col for species,col in species_to_label.items()}
         
-    #
-    all_obs_names = []
     # Add species to celltype name
-    for species, adata in species_to_adata.items():
+    # NOTE: it is important to keep alphabetical order here because this list will later be joined with
+    # get_all_embeddings which follows pytorch's default auto-batcher, which iterates using alphabetical order
+    # added by @iosonofabio
+    sorted_species_names = sorted(species_to_adata.keys())
+    all_obs_names = []
+    for species in sorted_species_names:
+        adata = species_to_adata[species]
         adata_label = args.in_label_col
         if args.in_label_col is None:
             adata_label = species_to_label_col[species]
@@ -467,7 +480,6 @@ def trainer(args):
         score_column = "ref_labels"
     else:
         score_column = "labels2"
-        
         
     # If we are using batch labels, add them as a column in our output anndatas and pass them as a categorical covariate to pretraining
     if use_batch_labels:
@@ -639,35 +651,47 @@ def trainer(args):
     
     
     #### Pretraining ####
-    pretrain_model = SATURNPretrainModel(gene_scores=centroid_weights, 
-                                   hidden_dim=hidden_dim, embed_dim=model_dim, 
-                                   dropout=0.1, species_to_gene_idx=species_to_gene_idx_hv, 
-                                   vae=args.vae, sorted_batch_labels_names=sorted_batch_labels_names, 
-                                   l1_penalty=args.l1_penalty, pe_sim_penalty=args.pe_sim_penalty).to(device)
-    
+    pretrain_model = SATURNPretrainModel(
+        gene_scores=centroid_weights, 
+        hidden_dim=hidden_dim,
+        embed_dim=model_dim, 
+        dropout=0.1,
+        species_to_gene_idx=species_to_gene_idx_hv, 
+        vae=args.vae,
+        sorted_batch_labels_names=sorted_batch_labels_names, 
+        l1_penalty=args.l1_penalty,
+        pe_sim_penalty=args.pe_sim_penalty,
+    ).to(device)
     
     if args.pretrain:
         optim_pretrain = optim.Adam(pretrain_model.parameters(), lr=args.pretrain_lr)
-        pretrain_loader = torch.utils.data.DataLoader(dataset, collate_fn=multi_species_collate_fn,
-                                        batch_size=args.pretrain_batch_size, shuffle=True)
+        pretrain_loader = torch.utils.data.DataLoader(
+            dataset,
+            collate_fn=multi_species_collate_fn,
+            batch_size=args.pretrain_batch_size,
+            shuffle=True,
+        )
         
-        pretrain_model = pretrain_saturn(pretrain_model, pretrain_loader, optim_pretrain, 
-                                            args.device, args.pretrain_epochs, 
-                                            sorted_species_names, balance=args.balance_pretrain, 
-                                            use_batch_labels=use_batch_labels, embeddings_tensor=X.to(device))
+        pretrain_model = pretrain_saturn(
+            pretrain_model,
+            pretrain_loader,
+            optim_pretrain, 
+            args.device,
+            args.pretrain_epochs, 
+            sorted_species_names,
+            balance=args.balance_pretrain, 
+            use_batch_labels=use_batch_labels,
+            embeddings_tensor=X.to(device),
+        )
     
         if args.pretrain_model_path != None:
             # Save the pretraining model if asked to
             print(f"Saved Pretrain Model to {args.pretrain_model_path}")
             torch.save(pretrain_model.state_dict(), args.pretrain_model_path)
             
-            
-            
     if args.pretrain_model_path != None:
         pretrain_model.load_state_dict(torch.load(args.pretrain_model_path))
         print("Loaded Pretrain Model")
-      
-    
     
     # write the weights
     final_scores = pretrain_model.p_weights.exp().detach().cpu().numpy().T
@@ -679,7 +703,15 @@ def trainer(args):
     metric_dir.mkdir(parents=True, exist_ok=True)
     run_name = args.dir_.split(args.log_dir)[-1]
     
-    with open(metric_dir / f'{run_name}_genes_to_macrogenes.pkl', "wb") as f:
+    # NOTE: added by @iosonofabio to fix too long file names with many species
+    if len(run_name) > 50:
+        gene_to_macrogene_fn = "genes_to_macrogenes.pkl"
+        pretrain_adata_fn = "adata_pretrain.h5ad"
+    else:
+        gene_to_macrogene_fn = f'{run_name}_genes_to_macrogenes.pkl'
+        pretrain_adata_fn = f'{run_name}_pretrain.h5ad'
+
+    with open(metric_dir / gene_to_macrogene_fn, "wb") as f:
         pickle.dump(species_genes_scores_final, f, protocol=4) # Save the scores dict
     
     # create the pretrain adata
@@ -691,13 +723,13 @@ def trainer(args):
                                         train_macrogenes.cpu().numpy(), train_ref, 
                                         celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names)  
     else:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings(test_dataset, pretrain_model, device, use_batch_labels)
+        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings(test_dataset, pretrain_model, device, use_batch_labels, obs_names=all_obs_names)
     
         adata = create_output_anndata(train_emb, train_lab, train_species, 
                                         train_macrogenes.cpu().numpy(), train_ref, 
                                         celltype_id_map, reftype_id_map, obs_names=all_obs_names)        
     
-    pretrain_adata_path = metric_dir / f'{run_name}_pretrain.h5ad'
+    pretrain_adata_path = metric_dir / pretrain_adata_fn
     adata.write(pretrain_adata_path)
 
     # Score the pretraining Dataset
@@ -831,7 +863,15 @@ def trainer(args):
                 adata = create_output_anndata(train_emb, train_lab, train_species, 
                                                     train_macrogenes.cpu().numpy(), train_ref, 
                                                     celltype_id_map, reftype_id_map, obs_names=all_obs_names)
-            ml_intermediate_path = metric_dir / f'{run_name}_ep_{epoch}.h5ad'
+
+
+            # NOTE: added by @iosonofabio to fix too long file names with many species
+            if len(run_name) > 50:
+                ml_intermediate_fn = f'adata_ep_{epoch}.h5ad'
+            else:
+                ml_intermediate_fn = f'{run_name}_ep_{epoch}.h5ad'
+
+            ml_intermediate_path = metric_dir / ml_intermediate_fn
             adata.write(ml_intermediate_path)
             
             if args.score_adatas:
@@ -859,16 +899,30 @@ def trainer(args):
         adata = create_output_anndata(train_emb, train_lab, train_species, 
                                             train_macrogenes.cpu().numpy(), train_ref, 
                                             celltype_id_map, reftype_id_map, obs_names=all_obs_names)
-    final_path = metric_dir / f'{run_name}.h5ad'
+
+    # NOTE: added by @iosonofabio to fix too long file names with many species
+    if len(run_name) > 50:
+        final_adata_fn = "final_adata.h5ad"
+        triplets_fn = "triplets.csv"
+        epoch_scores_fn = "epoch_scores.csv"
+        celltype_id_fn = "celltype_id.pkl"
+    else:
+        final_adata_fn = f'{run_name}.h5ad'
+        triplets_fn = f'{run_name}_triplets.csv'
+        epoch_scores_fn = f'{run_name}_epoch_scores.csv'
+        celltype_id_fn = f'{run_name}_celltype_id.pkl'
+
+
+    final_path = metric_dir / final_adata_fn
     adata.write(final_path)
     
-    final_path_triplets = metric_dir / f'{run_name}_triplets.csv'
+    final_path_triplets = metric_dir / triplets_fn
     all_indices_counts.to_csv(final_path_triplets, index=False)
     
-    final_path_epoch_scores = metric_dir / f'{run_name}_epoch_scores.csv'
+    final_path_epoch_scores = metric_dir / epoch_scores_fn
     scores_df.to_csv(final_path_epoch_scores, index=False)
     
-    final_path_ctid = metric_dir / f'{run_name}_celltype_id.pkl'
+    final_path_ctid = metric_dir / celltype_id_fn
     with open(final_path_ctid, "wb+") as f:
         pickle.dump(celltype_id_map, f)
     
