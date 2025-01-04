@@ -777,11 +777,14 @@ def trainer(args):
 
         # metric model will have params copied over, initialize it, only takes
         # macrogene values as inputs since we have frozen them
-        metric_model = SATURNMetricModel(input_dim=train_macrogenes.shape[1], 
-                                       hidden_dim=hidden_dim, embed_dim=model_dim, 
-                                       dropout=0.1, 
-                                       species_to_gene_idx=species_to_gene_idx_hv, 
-                                       vae=args.vae)
+        metric_model = SATURNMetricModel(
+            input_dim=train_macrogenes.shape[1],
+            hidden_dim=hidden_dim,
+            embed_dim=model_dim,
+            dropout=0.1,
+            species_to_gene_idx=species_to_gene_idx_hv,
+            vae=args.vae,
+        )
         # Copy over the pretrain model parameters to the metric model
         if pretrain_model.vae:
             metric_model.fc_mu = deepcopy(pretrain_model.fc_mu)
@@ -885,6 +888,11 @@ def trainer(args):
                 scores_df = pd.concat((scores_df, pd.DataFrame([lr_cross_row])), ignore_index=True)
             
      # Write outputs to file
+    if args.metric_model_path != None:
+        # Save the pretraining model if asked to
+        print(f"Saving Metric Model to {args.metric_model_path}")
+        torch.save(metric_model.state_dict(), args.metric_model_path)
+
     print("Saving Final AnnData")
     if use_batch_labels:
         train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(\
@@ -1027,6 +1035,8 @@ if __name__ == '__main__':
                         help='Metric Learning learning rate')
     parser.add_argument('--epochs', type=int,
                         help='Number of epochs for metric learning')
+    parser.add_argument('--metric_model_path', type=str,
+                        help='Path to save/load a metric (macrogene -> embedding) model to')
     
     # Balancing arguments
     parser.add_argument('--balance_pretrain', type=bool, nargs='?', const=True,
