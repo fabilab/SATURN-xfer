@@ -30,7 +30,7 @@ from data.gene_embeddings import load_gene_embeddings_adata
 from data.multi_species_data import ExperimentDatasetMulti, multi_species_collate_fn, ExperimentDatasetMultiEqualCT
 from data.multi_species_data import ExperimentDatasetMultiEqual
 
-from model.saturn_model import SATURNPretrainModel, SATURNMetricModel, make_centroids
+from model.saturn_model import SATURNPretrainModel, SATURNMetricModel, make_centroids, score_genes_against_centroids
 import torch.nn.functional as F
 from tqdm import trange, tqdm
 from pretrain_utils import *
@@ -51,9 +51,10 @@ from utils import stop_conditions
 import random
 
 
-def train(model, loss_func, mining_func, device,
-                train_loader, optimizer, epoch, mnn, 
-          sorted_species_names, use_ref_labels=False, indices_counts={}, equalize_triplets_species=False):
+def train(
+    model, loss_func, mining_func, device,
+    train_loader, optimizer, epoch, mnn, 
+    sorted_species_names, use_ref_labels=False, indices_counts={}, equalize_triplets_species=False):
     '''
     Train one epoch for a SATURN model with Metric Learning
     
@@ -136,7 +137,6 @@ def train(model, loss_func, mining_func, device,
                   "= {}".format(epoch, batch_idx, loss,
                                 mining_func.num_triplets))
 
-
 def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs, 
                        sorted_species_names, balance=False, use_batch_labels=False, embeddings_tensor=None):
     '''
@@ -156,7 +156,7 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
     
     
     print('Pretraining...')
-    model.train()
+    model.train();
     
     if balance:
         all_labels = []
@@ -186,7 +186,7 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
     for species in sorted_species_names:
         all_ave_losses[species] = []
     for epoch in pbar:
-        model.train()
+        model.train();
         epoch_ave_losses = {}
         for species in sorted_species_names:
             epoch_ave_losses[species] = []
@@ -197,13 +197,12 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
         epoch_triplet_loss = []
 
         for batch_idx, batch_dict in enumerate(pretrain_loader):
-            # TODO: understand why on Earth we would zero_grad here, since mini-batches end up optimised
-            # indipendently as a consequence of this?
             optimizer.zero_grad()
 
             batch_loss = 0
             for species in np.random.choice(sorted_species_names, size=len(sorted_species_names), replace=False):
                 # NOTE: added by @iosonofabio, this seems to be the intent from 3 lines below
+                # FIXME: this seems to create problems...
                 if species not in batch_dict:
                     continue
 
@@ -252,7 +251,6 @@ def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs,
             rank_loss = model.pe_sim_penalty * model.gene_weight_ranking_loss(model.p_weights.exp(), embeddings_tensor)
            
             batch_loss += l1_loss + rank_loss
-            # TODO: why is there zero_grad here as well?
             optimizer.zero_grad()
             batch_loss.backward()
             optimizer.step()
@@ -288,6 +286,7 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
         batch_size=1024,
         shuffle=False,
     )
+    # NOTE: this is inference time, so we use a combo of model.eval and torch.no_grad
     model.eval()
     embs = []
     macrogenes = []
@@ -297,6 +296,7 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
     if use_batch_labels:
         batch_labs = []
     
+    # This is inference, not training, so we don't need gradients (in fact, we want the weights frozen)
     with torch.no_grad():
         for batch_idx, batch_dict in tqdm(enumerate(test_loader), total=len(test_loader)):
             for species, (data, labels, ref_labels, batch_labels) in batch_dict.items():
@@ -309,15 +309,25 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
                 else:
                     data, labels, ref_labels = data.to(device), labels.to(device), ref_labels.to(device)
 
+                    # NOTE: This is where inference is actually carried out (!)
+                    # Calling the model looks like it's calling the forward function, wrapped in some no_grad magic
+                    # NOTE: this is always ONE species at a time.
                     encoder_inputs, encodeds, mus, log_var, px_rate, px_r, px_drop = model(data, species)
+
+                # These are the outputs of the model and how we store them:
+                # 1. the encoded output (the embedding)
+                # 2. the projection onto macrogenes (encoder input)
+                # 3. metadata (species, labels, barch if requested)
                 if model.vae:
                     for mu in mus:
                         embs.append(mu.detach().cpu())
                 else:
                     for encoded in encodeds:
                         embs.append(encoded.detach().cpu())
+
                 for encoder_input in encoder_inputs:
                     macrogenes.append(encoder_input.detach().cpu())
+
                 spec += [species] * data.shape[0]
                 labs = labs + list(labels.cpu().numpy())
                 refs = refs + list(ref_labels.cpu().numpy())
@@ -325,6 +335,7 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
                 if use_batch_labels:
                     batch_labs = batch_labs + list(batch_labels.cpu().numpy())
 
+    # ... and at the end of the day, we stack vertically everything and return
     if use_batch_labels:
         return torch.stack(embs).cpu().numpy(), np.array(labs), np.array(spec), torch.stack(macrogenes),\
                                                                 np.array(refs), np.array(batch_labs)
@@ -338,9 +349,12 @@ def get_all_embeddings_metric(dataset, model, device, use_batch_labels=False):
     Get the embeddings and other metadata for a trained SATURN model.
 
     Keyword arguments:
-    model -- the trained model, class is saturnMetricModel
+    model -- the trained model, class is SATURNMetricModel
     dataset -- macrogene values
     use_batch_labels -- if we add batch labels as a categorical covariate
+
+    Returns:
+        A few things including the embedded values (output of the full encoder) for both models.
     '''
     model.eval()
     embs = []
@@ -363,6 +377,8 @@ def get_all_embeddings_metric(dataset, model, device, use_batch_labels=False):
                 else:
                     data, labels, ref_labels = data.to(device), labels.to(device), ref_labels.to(device)
 
+                # This is where the inference (i.e. forward method) takes place.
+                # NOTE: this is always ONE species at a time.
                 encodeds = model(data, species)
                
                 for encoded in encodeds:
@@ -412,34 +428,25 @@ def create_output_anndata(train_emb, train_lab, train_species, train_macrogenes,
         adata.obs_names = obs_names
     return adata
 
-def trainer(args):
+def inferrer(args):
     '''
-    Runs the SATURN pipeline
+    Runs the inference pipeline
     '''
-    data_df = pd.read_csv(args.in_data, index_col="species")       
     # data_df should have columns for df location
-    species_to_path = data_df.to_dict()["path"]
+    species_to_path = {args.species: args.in_adata_path}
     species_to_adata = {species:sc.read(path) for species,path in species_to_path.items()}
-    species_to_embedding_paths = {species:None for species in species_to_path.keys()} # default to use existing paths
-    
-    if "embedding_path" in data_df.columns:
-        species_to_embedding_paths = {species:path for species,path in data_df.to_dict()["embedding_path"].items()}
+    species_to_embedding_paths = {args.species: args.in_embeddings_path}
         
-    species_to_drop = []
     if args.tissue_subset is not None:
         for species in species_to_adata.keys():
             ad = species_to_adata[species]
             species_to_adata[species] = ad[ad.obs[args.tissue_column] == args.tissue_subset]
             if species_to_adata[species].X.shape[0] == 0:
-                print(f"Dropping {species}")
-                species_to_drop.append(species)
-    for species in species_to_drop:
-        species_to_adata.pop(species)
-        species_to_path.pop(species)
+                raise ValueError(f"No cells in {args.tissue_subset} found in the input dataset")
     
     if args.in_label_col is None:
         # Assume in_label_col is set as the in_label_col column in the run DF 
-        species_to_label = data_df.to_dict()["in_label_col"]
+        species_to_label = {args.species: args.in_label_col}
         species_to_label_col = {species:col for species,col in species_to_label.items()}
         
     # Add species to celltype name
@@ -477,7 +484,6 @@ def trainer(args):
     
     num_batch_labels = 0
     use_batch_labels = args.non_species_batch_col is not None
-    
     
     if args.score_ref_labels:
         score_column = "ref_labels"
@@ -547,7 +553,6 @@ def trainer(args):
         species_to_gene_idx_hv[species] = (ct, ct+species_to_gene_embeddings[species].shape[0])
         ct+=species_to_gene_embeddings[species].shape[0]
         
-        
     # List of species_ + gene_name for macrogenes
     all_gene_names = []
     for species in sorted_species_names:
@@ -557,98 +562,96 @@ def trainer(args):
         all_gene_names += list(species_str.str.cat(gene_names, sep="_"))
     
     # stacked embeddings
-    # NOTE: these are stacked in alphabetical order of the species
     X = torch.cat([species_to_gene_embeddings[species] for species in sorted_species_names])
     
-    # Create or load the centroid weights
-    if args.centroids_init_path is not None:
-        # Try to load the centroids and scores, if not, create it.
-        try:
-            with open(args.centroids_init_path, "rb") as f:
-                tmp = pickle.load(f)
-                species_genes_scores = tmp["scores"]
-            print("Loaded centroids and scores")
-        except:
-            # create the centroids and save them to that location. Centroids are the unmodified macrogene weight values.
-            # We also save the modified macrogene values to a different file.
-            species_genes_scores, centroids_coords = make_centroids(
-                X, all_gene_names, args.num_macrogenes, seed=args.seed, score_function=args.centroid_score_func,
-                device=args.device,
-            )
-            with open(args.centroids_init_path, "wb") as f:
-                pickle.dump(
-                    {
-                        "scores": species_genes_scores,
-                        "centroids": centroids_coords,
-                        "score_func": args.centroid_score_func,
-                        "sorted_species_names": sorted_species_names,
-                        "species_to_gene_idx_hv": species_to_gene_idx_hv,
-                        "all_gene_names": all_gene_names,
-                    },
-                    f, protocol=4) # Save the scores dict
-            print(f"Saved centroids and scores to {args.centroids_init_path}")
+    # Load the centroid weights
+    with open(args.centroids_init_path, "rb") as f:
+        tmp = pickle.load(f)
+        species_genes_scores_trained = tmp['scores']
+        centroids_coords = tmp['centroids']
+        centroid_score_func = tmp.get('score_func', args.centroid_score_func)
+        sorted_species_names_trained = tmp['sorted_species_names']
+        species_to_gene_idx_hv_trained = tmp['species_to_gene_idx_hv']
+        all_gene_names_trained = tmp['all_gene_names']
+        del tmp
+    print("Loaded centroids and existing scores")
+
+    print("Score genes of new species against cluster centers")
+    species_genes_scores = score_genes_against_centroids(
+        X, centroids_coords, all_gene_names, score_function=centroid_score_func,
+    )
+    
+    # Initialize macrogenes, i.e. the weights from the initial gene embeddings to the centroid space
+    # The initial (i.e. before pretraining) weights are the scores/distances of the genes from each centroid
+    centroid_weights_trained = torch.stack([torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained])
+    centroid_weights = torch.stack([torch.tensor(species_genes_scores[gn]) for gn in all_gene_names])
+
+    if args.guide_species is not None:
+        species_closest = args.guide_species
     else:
-        # create the centroids and scores and don't save them, the centroids themselves are not used in the training
-        species_genes_scores, _ = make_centroids(
-            X, all_gene_names, args.num_macrogenes, seed=args.seed, score_function=args.centroid_score_func,
-            device=args.device,
-        )
-    
-    # Initialize macrogenes
-    centroid_weights = []
-    all_species_gene_names = []
-    for species in sorted_species_names:
-        adata = species_to_adata[species]
-        species_str = pd.Series([species] * adata.var_names.shape[0])
-        gene_names = pd.Series(adata.var_names)
-        species_gene_names = list(species_str.str.cat(gene_names, sep="_"))
-        all_species_gene_names = all_species_gene_names + species_gene_names
-        for sgn in species_gene_names:
-            centroid_weights.append(torch.tensor(species_genes_scores[sgn]))
-    centroid_weights =  torch.stack(centroid_weights)
+        metric = {}
+        for species in sorted_species_names_trained:
+            centroid_weights_trained_species = torch.stack(
+                [torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained if gn.startswith(species)],
+            )
+            cdist_species = torch.cdist(centroid_weights, centroid_weights_trained_species)
+            dis_closest = cdist_species.min(axis=1).values
+            nconserved = min(len(dis_closest), 50)
+            dis_mean = dis_closest[:nconserved].mean()
+            metric[species] = float(dis_mean)
+        metric = pd.Series(metric)
+        species_closest = metric.idxmin()
+        del metric, centroid_weights_trained_species, cdist_species, dis_closest, nconserved,  dis_mean
 
+    print(f"Closest species within the training set: {species_closest}.")
 
-    
-    # Make the train loader
+    print("Connect genes of new species with genes of closest species for inference")
+    genes_closest = [gn for gn in all_gene_names_trained if gn.startswith(species_closest)]
+    centroid_weights_trained_closest = torch.stack(
+        [torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained if gn.startswith(species_closest)],
+    )
+    # FIXME: we should probably use the actal distances in ESM embedding space, because apparently there are ambiguities here
+    species_genes_scores_closest = score_genes_against_centroids(
+        centroid_weights,
+        centroid_weights_trained_closest,
+        all_gene_names,
+        return_dict=False,
+    )
+    # Distribute gene counts onto genes of the closest species
+    species_genes_scores_closest_norm = (species_genes_scores_closest.T / species_genes_scores_closest.sum(axis=1)).T
+    X_projected = species_to_adata[args.species].X @ species_genes_scores_closest_norm
+    adata_projected = AnnData(
+        X=X_projected,
+        var=pd.DataFrame(index=genes_closest),
+        obs=species_to_adata[args.species].obs.copy(),
+    )
+
+    species_to_adata_inference = {
+        species_closest: adata_projected,
+    }
+
+    # Make the inference loader
     if use_batch_labels: # we have a batch column to use for the pretrainer
         dataset = ExperimentDatasetMultiEqual(
-            all_data = species_to_adata,
-            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata.items()},
-            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata.items()},
-            all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata.items()}
-        )
-        
-        test_dataset = ExperimentDatasetMulti(
-            all_data = species_to_adata,
-            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata.items()},
-            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata.items()},
-            all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata.items()}
+            all_data = species_to_adata_inference,
+            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_inference.items()},
+            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_inference.items()},
+            all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata_inference.items()}
         )
     else:
         dataset = ExperimentDatasetMultiEqual(
-            all_data = species_to_adata,
-            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata.items()},
-            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata.items()},
-            all_batch_labs = {}
-        )
-        
-        test_dataset = ExperimentDatasetMulti(
-            all_data = species_to_adata,
-            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata.items()},
-            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata.items()},
+            all_data = species_to_adata_inference,
+            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_inference.items()},
+            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_inference.items()},
             all_batch_labs = {}
         )
 
     hooks = logging_presets.get_hook_container(record_keeper)
-    tester = testers.GlobalEmbeddingSpaceTester(
-        end_of_testing_hook=hooks.end_of_testing_hook,
-        dataloader_num_workers=1,
-        use_trunk_output=True)
 
     device = torch.device(args.device)
     dt = str(datetime.now())[5:19].replace(' ', '_').replace(':', '-')
     
-    args.dir_ = args.work_dir + args.log_dir + \
+    args.dir_ = args.work_dir.rstrip('/') + '/' + args.log_dir + \
                 'test'+str(args.model_dim)+\
                 '_data_'
     
@@ -662,104 +665,82 @@ def trainer(args):
                 ('_'+args.tissue_subset if args.tissue_subset else '') +\
                 ('_seed_'+str(args.seed))
 
-    model_dim = args.model_dim
-    hidden_dim = args.hidden_dim    
-    
     
     if use_batch_labels:
         sorted_batch_labels_names=list(unique_batch_types)
     else:
         sorted_batch_labels_names = None
     
-    
-    #### Pretraining ####
+    #### Inference through the pretrainin model: gene expression + embeddings -> macrogenes ####
+    pretrain_state_dict = torch.load(args.pretrain_model_path)
+
+    # FIXME: this does not take into account the VAE variant of SATURN. Ok for now, in that case it should fail egregiously
+    # The number of classes in the pretrain model is the number of macrogenes/centroids
+    # notice that the input is shape[1], not shape[0], this is some quirk of torch
+    assert pretrain_state_dict['encoder.0.0.weight'].shape[1] == centroids_coords.shape[0]
+    # The output of the first linear layer within the first encoder is the hidden dimension
+    hidden_dim = pretrain_state_dict['encoder.0.0.weight'].shape[0]
+    # That is also the input to the second encoder block
+    assert pretrain_state_dict['encoder.1.0.weight'].shape[1] == hidden_dim
+    # The output of the linear layer within the second encoder block is the embedding dimension
+    # This is complicated by the fact that the defaults for both are both 256.
+    model_dim = pretrain_state_dict['encoder.1.0.weight'].shape[0]
+
     pretrain_model = SATURNPretrainModel(
-        gene_scores=centroid_weights, 
+        gene_scores=centroid_weights_trained, 
         hidden_dim=hidden_dim,
         embed_dim=model_dim, 
         dropout=0.1,
-        species_to_gene_idx=species_to_gene_idx_hv, 
-        vae=args.vae,
+        species_to_gene_idx=species_to_gene_idx_hv_trained, 
+        vae=False,
         sorted_batch_labels_names=sorted_batch_labels_names, 
-        l1_penalty=args.l1_penalty,
-        pe_sim_penalty=args.pe_sim_penalty,
     ).to(device)
     
-    if args.pretrain:
-        optim_pretrain = optim.Adam(pretrain_model.parameters(), lr=args.pretrain_lr)
-        pretrain_loader = torch.utils.data.DataLoader(
-            dataset,
-            collate_fn=multi_species_collate_fn,
-            batch_size=args.pretrain_batch_size,
-            shuffle=True,
-        )
-        
-        pretrain_model = pretrain_saturn(
-            pretrain_model,
-            pretrain_loader,
-            optim_pretrain, 
-            args.device,
-            args.pretrain_epochs, 
-            sorted_species_names,
-            balance=args.balance_pretrain, 
-            use_batch_labels=use_batch_labels,
-            embeddings_tensor=X.to(device),
+    pretrain_model.load_state_dict(pretrain_state_dict)
+    print("Loaded Pretrain Model")
+
+    # create the pretrain adata
+    print("Infer embedding using pretrained model")
+    if use_batch_labels:
+        # Run inference (dataset is the new gene expression data, projected with nonnegative weights onto the closest species)
+        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings(
+            dataset, pretrain_model, device, use_batch_labels,
         )
     
-        if args.pretrain_model_path != None:
-            # Save the pretraining model if asked to
-            print(f"Saved Pretrain Model to {args.pretrain_model_path}")
-            torch.save(pretrain_model.state_dict(), args.pretrain_model_path)
-            
-    if args.pretrain_model_path != None:
-        pretrain_model.load_state_dict(torch.load(args.pretrain_model_path))
-        print("Loaded Pretrain Model")
+        # Build an AnnData for exporting, in embedding space
+        adata = create_output_anndata(
+            train_emb, train_lab, train_species, 
+            train_macrogenes.cpu().numpy(), train_ref, 
+            celltype_id_map, reftype_id_map, use_batch_labels,
+            batchtype_id_map, train_batch, obs_names=all_obs_names,
+        )  
+    else:
+        # Run inference (dataset is the new gene expression data, projected with nonnegative weights onto the closest species)
+        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings(
+            dataset, pretrain_model, device, use_batch_labels, obs_names=all_obs_names,
+        )
     
-    # write the weights
-    final_scores = pretrain_model.p_weights.exp().detach().cpu().numpy().T
-    species_genes_scores_final = {}
-    for i, gene_species_name in enumerate(all_species_gene_names):
-        species_genes_scores_final[gene_species_name] = final_scores[i, :]
-    
-    metric_dir = Path(args.work_dir) / 'saturn_results'
+        # Build an AnnData for exporting, in embedding space
+        adata = create_output_anndata(
+            train_emb, train_lab, train_species, 
+            train_macrogenes.cpu().numpy(), train_ref, 
+            celltype_id_map, reftype_id_map, obs_names=all_obs_names,
+        )        
+
+    adata.obs['species'] = args.species
+
+    print("Store AnnData in embedding space inferred through pretrained model")
+    metric_dir = Path(args.work_dir)
     metric_dir.mkdir(parents=True, exist_ok=True)
     run_name = args.dir_.split(args.log_dir)[-1]
-    
-    # NOTE: added by @iosonofabio to fix too long file names with many species
-    if len(run_name) > 50:
-        gene_to_macrogene_fn = "genes_to_macrogenes.pkl"
-        pretrain_adata_fn = "adata_pretrain.h5ad"
-    else:
-        gene_to_macrogene_fn = f'{run_name}_genes_to_macrogenes.pkl'
-        pretrain_adata_fn = f'{run_name}_pretrain.h5ad'
 
-    with open(metric_dir / gene_to_macrogene_fn, "wb") as f:
-        pickle.dump(species_genes_scores_final, f, protocol=4) # Save the scores dict
-    
-    # create the pretrain adata
-    print("Saving Pretrain AnnData")
-    if use_batch_labels:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings(test_dataset, pretrain_model, device, use_batch_labels)
-    
-        adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                        train_macrogenes.cpu().numpy(), train_ref, 
-                                        celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names)  
-    else:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings(test_dataset, pretrain_model, device, use_batch_labels, obs_names=all_obs_names)
-    
-        adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                        train_macrogenes.cpu().numpy(), train_ref, 
-                                        celltype_id_map, reftype_id_map, obs_names=all_obs_names)        
-    
+    pretrain_adata_fn = f'{run_name}_inference_from_pretrain.h5ad'
     pretrain_adata_path = metric_dir / pretrain_adata_fn
     adata.write(pretrain_adata_path)
 
-    # Score the pretraining Dataset
-    if args.score_adatas:
-        print("*****PRETRAIN SCORES*****")
-        get_all_scores(pretrain_adata_path, args.ct_map_path, score_column, 
-                       sorted_species_names[0], sorted_species_names[1], num_scores=1)
+    print("***END OF PRETRAINING INFERENCE***")
     print("-----------------------------")
+    return
     
     #### Metric Learning ####
     print("***STARTING METRIC LEARNING***")
@@ -831,19 +812,12 @@ def trainer(args):
     
     
     # TripletMarginMMDLoss
-    loss_func = losses.TripletMarginLoss(
-        margin=0.2,
-        distance=distance,
-        reducer=reducer,
-    )
+    loss_func = losses.TripletMarginLoss(margin = 0.2,
+                            distance = distance, reducer = reducer)
 
-    mining_func = miners.TripletMarginMiner(
-        margin=0.2,
-        distance=distance,
-        type_of_triplets="semihard",
-        miner_type="cross_species",
-    )
-
+    mining_func = miners.TripletMarginMiner(margin = 0.2,
+                            distance = distance, type_of_triplets = "semihard",
+                            miner_type = "cross_species")
     print("***STARTING METRIC TRAINING***")
     all_indices_counts = pd.DataFrame(columns=["Epoch", "Triplet", "Count"])
     
@@ -851,17 +825,17 @@ def trainer(args):
     batch_size_multiplier = 1
     for epoch in range(1, args.epochs+1):
         epoch_indices_counts = {}
+        
                
         train(metric_model, loss_func, mining_func, device,
               train_loader, optimizer, epoch, args.mnn, 
               sorted_species_names, use_ref_labels=args.use_ref_labels, indices_counts=epoch_indices_counts, 
               equalize_triplets_species = args.equalize_triplets_species)
-
         epoch_df = pd.DataFrame.from_records(list(epoch_indices_counts.items()), columns=["Triplet", "Count"])
         epoch_df["Epoch"] = epoch
         all_indices_counts = pd.concat((all_indices_counts, epoch_df))
         
-        if epoch % args.polling_freq == 0:
+        if epoch%args.polling_freq==0:
             if use_batch_labels:
                 train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(\
                     test_dataset, metric_model, device, use_batch_labels)
@@ -881,7 +855,7 @@ def trainer(args):
             mmd_row = stop_conditions.median_min_distance_score(adata, epoch)
             scores_df = pd.concat((scores_df, pd.DataFrame([mmd_row])), ignore_index=True)
                     
-        if epoch % args.polling_freq == 0:
+        if epoch%args.polling_freq==0:
             if use_batch_labels:
                 train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric( \
                                                                        test_dataset, metric_model, device, use_batch_labels)
@@ -979,8 +953,12 @@ if __name__ == '__main__':
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # Run Setup
-    parser.add_argument('--in_data', type=str,
-                        help='Path to csv containing input datas and species')
+    parser.add_argument('--in_adata_path', type=str, required=True,
+                        help='Path to h5ad of the data to infer')
+    parser.add_argument('--in_embeddings_path', type=str, required=True,
+                        help='Path to embeddings summary pt file for the peptides of the species to infer')
+    parser.add_argument('--species', type=str, help="Data to infer belongs to this species (optional)")
+    parser.add_argument('--guide-species', type=str, help="Choose a guide species to project gene expression onto. Default is to take the one with the closest embeddings for conserved proteins.")
     parser.add_argument('--device', type=str,
                     help='Set GPU/CPU')
     parser.add_argument('--device_num', type=int,
@@ -1009,9 +987,7 @@ if __name__ == '__main__':
                         help='Number of highly variable genes')
     parser.add_argument('--hv_span', type=float,
                         help='Fraction of cells to use when calculating highly variable genes, scanpy defeault is 0.3.')
-    parser.add_argument('--num_macrogenes', type=int,
-                        help='Number of macrogenes')
-    parser.add_argument('--centroids_init_path', type=str,
+    parser.add_argument('--centroids_init_path', type=str, required=True,
                         help='Path to existing centroids pretraining weights, or location to save to.')
     parser.add_argument('--embedding_model', type=str, choices=['ESM1b', 'MSA1b', 'protXL', 'ESM1b_protref', 'ESM2'],
                     help='Gene embedding model whose embeddings should be loaded if using gene_embedding_method')
@@ -1020,8 +996,6 @@ if __name__ == '__main__':
     
     
     # Model Setup
-    parser.add_argument('--vae', type=bool, nargs='?', const=True,
-                        help='Set the embedding layer to be a VAE.')
     parser.add_argument('--hidden_dim', type=int,
                         help='Model first layer hidden dimension')
     parser.add_argument('--model_dim', type=int,
@@ -1036,68 +1010,30 @@ if __name__ == '__main__':
     
     
     # Pretrain Arguments
-    parser.add_argument('--pretrain', type=bool, nargs='?', const=True,
-                    help='Pretrain the model')
-    parser.add_argument('--pretrain_model_path', type=str,
+    parser.add_argument('--pretrain_model_path', type=str, required=True,
                         help='Path to save/load a pretraining model to')
-    parser.add_argument('--pretrain_lr', type=float,
-                        help='Pre training Learning learning rate')    
     parser.add_argument('--pretrain_batch_size', type=int,
                         help='pretrain batch size')
-    parser.add_argument('--l1_penalty', type=float,
-                        help='L1 Penalty hyperparameter Default is 0.')
-    parser.add_argument('--pe_sim_penalty', type=float,
-                        help='Protein Embedding similarity to Macrogene loss, weight hyperparameter. Default is 1.0')
     
     # Metric Learning Arguments
-    parser.add_argument('--pretrain_epochs', type=int,
-                        help='Number of pretraining epochs')
     parser.add_argument('--unfreeze_macrogenes', type=bool, nargs='?', const=True,
                         help='Let Metric Learning Modify macrogene weights')
-    parser.add_argument('--mnn', type=bool, nargs='?', const=True, 
-                        help='Use mutual nearest neighbors')
     parser.add_argument('--use_ref_labels', type=bool, nargs='?', const=True, 
                     help='Use reference labels when aligning')
     parser.add_argument('--batch_size', type=int,
                         help='batch size')
-    parser.add_argument('--metric_lr', type=float,
-                        help='Metric Learning learning rate')
-    parser.add_argument('--epochs', type=int,
-                        help='Number of epochs for metric learning')
-    parser.add_argument('--metric_model_path', type=str,
+
+    parser.add_argument('--metric_model_path', type=str, required=True,
                         help='Path to save/load a metric (macrogene -> embedding) model to')
     
-    # Balancing arguments
-    parser.add_argument('--balance_pretrain', type=bool, nargs='?', const=True,
-                        help='Balance cell types\' weighting in the pretraining model')
-    parser.add_argument('--equalize_triplets_species', type=bool, nargs='?', const=True,
-                        help='Balance species\' weighting in the metric learning model')
-    parser.add_argument('--balance_species_cells', type=bool, nargs='?', const=True,
-                        help='Balance species\' number of cells in all steps by resampling randomly.')  
-    
-    
-    # Extra Batch Correction Arguments
-    parser.add_argument('--non_species_batch_col', type=str,
-                        help='Extra column for batch correction for pretraining. For example, the tissue column in atlas data.')
-    
-    
-    # Scoring argumetns
-    parser.add_argument('--polling_freq', type=int,
-                        help='Epoch Frequency of scoring during metric learning')
-    parser.add_argument('--score_adatas', type=bool, nargs='?', const=True, 
-                help='Score the pretraining and metric learning adatas.')
-    parser.add_argument('--ct_map_path', type=str,
-                        help='Path to csv containing label column mappings between species')
-    parser.add_argument('--score_ref_labels', type=bool, nargs='?', const=True,
-                        help='Use the ref labels to score instead of the labels.')
     # Defaults
     parser.set_defaults(
-        in_data=None,
         org='saturn',
+        species="new",
+        guide_species=None,
         in_label_col=None,
         ref_label_col="CL_class_coarse",
         non_species_batch_col=None,
-        ct_map_path='/dfs/project/cross-species/yanay/fz_true_ct.csv',
         device= torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         device_num=0,
         pretrain_batch_size=4096,
@@ -1105,7 +1041,6 @@ if __name__ == '__main__':
         model_dim=256,
         hidden_dim=256,
         hv_genes=8000,
-        num_macrogenes=2000,
         epochs=50,
         metric_lr=0.001,
         pretrain_epochs=200,
@@ -1123,18 +1058,10 @@ if __name__ == '__main__':
         scale_expression=False,
         score_adatas=False,
         seed=0,
-        pretrain_model_path=None,
         unfreeze_macrogenes=False,
-        balance_pretrain=False,
-        polling_freq=25,
-        equalize_triplets_species=False,
-        balance_species_cells=False,
-        pretrain_lr=0.0005,
         score_ref_labels=False,
         tissue_subset=None,
         tissue_column="tissue_type",
-        l1_penalty=0.0,
-        pe_sim_penalty=0.2,
         hv_span=0.3,
         centroid_score_func="default"
     )
@@ -1142,6 +1069,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     torch.cuda.set_device(args.device_num)
     print(f"Using Device {args.device_num}")
+
     # Numpy seed
     np.random.seed(args.seed)
     # Torch Seed
@@ -1150,9 +1078,8 @@ if __name__ == '__main__':
     random.seed(args.seed)
     
     print(f"Set seed to {args.seed}")
-    if not args.balance_species_cells:
-        # Don't Balance the species numbers
-        ExperimentDatasetMultiEqual = ExperimentDatasetMulti
+    # Don't Balance the species numbers
+    ExperimentDatasetMultiEqual = ExperimentDatasetMulti
 
-    trainer(args)
+    inferrer(args)
 
