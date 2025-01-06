@@ -607,18 +607,41 @@ def inferrer(args):
 
     print("Connect genes of new species with genes of closest species for inference")
     genes_closest = [gn for gn in all_gene_names_trained if gn.startswith(species_closest)]
-    centroid_weights_trained_closest = torch.stack(
-        [torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained if gn.startswith(species_closest)],
+
+    tmp = pd.read_csv(args.training_csv_path, index_col="species")
+    adata_path_closest = tmp.at[species_closest, "path"]
+    embedding_path_closest = tmp.at[species_closest, "embedding_path"]
+    adata_closest = sc.read(adata_path_closest)
+
+    adata_closest, species_gene_embeddings_closest = load_gene_embeddings_adata(
+        adata=adata_closest,
+        species=[species_closest],
+        embedding_model=args.embedding_model,
+        embedding_path=embedding_path_closest,
     )
-    # FIXME: we should probably use the actal distances in ESM embedding space, because apparently there are ambiguities here
+    # Match genes against HVGs in the closest training species, using the original embeddings
+    genes_closest_nospecies = [x[len(species_closest) + 1:] for x in genes_closest]
+    idx_hvg_closest = pd.Series(np.arange(adata_closest.n_vars), index=adata_closest.var_names).loc[genes_closest_nospecies].values
+    gene_embeddings_closest_hvg = species_gene_embeddings_closest[species_closest][idx_hvg_closest]
+
+    # Get the matix matching genes to the guide species genes. "one-hot" means winner takes all (two 1st prizes for equal distance)
+    # This is the only one of the three currently used metrics that becomes exact in the limit of inferring a species that is
+    # already in the database. Otherwise one could write new scoring systems that diverge for d -> 0+, so that upon Normalisation
+    # (next line of code) only the closest match wins.
+    # NOTE: For exact species matches, this is a sparse matrix (1-1 matching of genes). For nonexact matches, it will be dense.
     species_genes_scores_closest = score_genes_against_centroids(
-        centroid_weights,
-        centroid_weights_trained_closest,
+        species_to_gene_embeddings[args.species],
+        gene_embeddings_closest_hvg,
         all_gene_names,
         return_dict=False,
+        score_function="one_hot",
     )
-    # Distribute gene counts onto genes of the closest species
+
+    # Normalise the scores to one, to maintain overall gene expression onto the new species
+    # NOTE: this is all happening in HVG space btw
     species_genes_scores_closest_norm = (species_genes_scores_closest.T / species_genes_scores_closest.sum(axis=1)).T
+
+    # Distribute gene counts onto genes of the closest species
     X_projected = species_to_adata[args.species].X @ species_genes_scores_closest_norm
     adata_projected = AnnData(
         X=X_projected,
@@ -957,6 +980,8 @@ if __name__ == '__main__':
                         help='Path to h5ad of the data to infer')
     parser.add_argument('--in_embeddings_path', type=str, required=True,
                         help='Path to embeddings summary pt file for the peptides of the species to infer')
+    parser.add_argument('--training_csv_path', type=str, required=True,
+                        help='Path to csv containing training adata and embedding paths and species names')
     parser.add_argument('--species', type=str, help="Data to infer belongs to this species (optional)")
     parser.add_argument('--guide-species', type=str, help="Choose a guide species to project gene expression onto. Default is to take the one with the closest embeddings for conserved proteins.")
     parser.add_argument('--device', type=str,
