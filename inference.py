@@ -30,7 +30,7 @@ from data.gene_embeddings import load_gene_embeddings_adata
 from data.multi_species_data import ExperimentDatasetMulti, multi_species_collate_fn, ExperimentDatasetMultiEqualCT
 from data.multi_species_data import ExperimentDatasetMultiEqual
 
-from model.saturn_model import SATURNPretrainModel, SATURNMetricModel, make_centroids, score_genes_against_centroids
+from model.saturn_model import SATURNPretrainModel, SATURNMetricModel, TransferModel, make_centroids, score_genes_against_centroids
 import torch.nn.functional as F
 from tqdm import trange, tqdm
 from pretrain_utils import *
@@ -286,6 +286,7 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
         batch_size=1024,
         shuffle=False,
     )
+
     # NOTE: this is inference time, so we use a combo of model.eval and torch.no_grad
     model.eval()
     embs = []
@@ -343,8 +344,6 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
         return torch.stack(embs).cpu().numpy(), np.array(labs), np.array(spec), torch.stack(macrogenes), np.array(refs)
 
 def get_all_embeddings_metric(dataset, model, device, use_batch_labels=False):
-    test_loader = torch.utils.data.DataLoader(dataset, collate_fn=multi_species_collate_fn,
-                                        batch_size=1024, shuffle=False)
     '''
     Get the embeddings and other metadata for a trained SATURN model.
 
@@ -356,6 +355,14 @@ def get_all_embeddings_metric(dataset, model, device, use_batch_labels=False):
     Returns:
         A few things including the embedded values (output of the full encoder) for both models.
     '''
+    test_loader = torch.utils.data.DataLoader(
+        dataset,
+        collate_fn=multi_species_collate_fn,
+        batch_size=1024,
+        shuffle=False,
+    )
+
+    # NOTE: this is inference time, so we use a combo of model.eval and torch.no_grad
     model.eval()
     embs = []
     macrogenes = []
@@ -749,7 +756,6 @@ def inferrer(args):
             train_macrogenes.cpu().numpy(), train_ref, 
             celltype_id_map, reftype_id_map, obs_names=all_obs_names,
         )        
-
     adata.obs['species'] = args.species
 
     print("Store AnnData in embedding space inferred through pretrained model")
@@ -763,211 +769,94 @@ def inferrer(args):
 
     print("***END OF PRETRAINING INFERENCE***")
     print("-----------------------------")
-    return
     
-    #### Metric Learning ####
-    print("***STARTING METRIC LEARNING***")
+    print("***STARTING TRANSFER LEARNING***")
+    # NOTE: train_macrogenes is the input of the pretraining encoder, i.e. the gene expression passed through
+    # a single custom encoder block (p_weights -> cl_layer_norm -> relu -> dropout) -- NOT a single layer.
+    # The entire point of pretrain_model.forward returning it is such that we can use it as input in the
+    # follow-up metric model, which can now accept macrogene space info without worrying too much.
+
     if args.unfreeze_macrogenes:
         print("***MACROGENE WEIGHTS UNFROZEN***")
-    # Start Metric Learning 
-    
-    metric_dataset = dataset
-    test_metric_dataset = test_dataset
-    if (not args.unfreeze_macrogenes):
-        # metric_dataset = test_dataset
-        
-        # Create the new dataset with the macrogenes as input
-        metric_dataset.num_genes = {species:train_macrogenes.shape[1] for species in sorted_species_names}
-        
-        ct = 0
-        for species in sorted_species_names:
-            species_ct = metric_dataset.xs[species]
-            n_cells = species_ct.shape[0]
-            species_macrogenes = train_macrogenes[ct:(ct+n_cells), :]
-            ct += n_cells
-            metric_dataset.xs[species] = species_macrogenes
-            
-        test_metric_dataset.num_genes = {species:train_macrogenes.shape[1] for species in sorted_species_names}
 
-        ct = 0
-        for species in sorted_species_names:
-            species_ct = test_metric_dataset.xs[species]
-            n_cells = species_ct.shape[0]
-            species_macrogenes = train_macrogenes[ct:(ct+n_cells), :]
-            ct += n_cells
-            test_metric_dataset.xs[species] = species_macrogenes
-    
-    
-    
-        pretrain_model = pretrain_model.cpu()
+    # NOTE: here we try to first infer from the metric model starting from:
+    # - train_macrogenes
+    # - the name (and CSR-like indices) of the guide species
+    # Output of the inference, as per the model class forward method, is the encoded gene expression
+    # in embedding space.
+    # TODO: we are not doing any fine-tuning for the time being, but we might in the future using
+    # triplet loss.
 
-        # metric model will have params copied over, initialize it, only takes
-        # macrogene values as inputs since we have frozen them
-        metric_model = SATURNMetricModel(
-            input_dim=train_macrogenes.shape[1],
-            hidden_dim=hidden_dim,
-            embed_dim=model_dim,
-            dropout=0.1,
-            species_to_gene_idx=species_to_gene_idx_hv,
-            vae=args.vae,
-        )
-        # Copy over the pretrain model parameters to the metric model
-        if pretrain_model.vae:
-            metric_model.fc_mu = deepcopy(pretrain_model.fc_mu)
-            metric_model.fc_var = deepcopy(pretrain_model.fc_var)
-        metric_model.cl_layer_norm = deepcopy(pretrain_model.cl_layer_norm)
-        metric_model.encoder = deepcopy(pretrain_model.encoder)
-    else:
-        metric_model = pretrain_model
-        metric_model.metric_learning_mode = True
-    
-    metric_model.to(device) 
-    optimizer = optim.Adam(metric_model.parameters(), lr=args.metric_lr)
-    
-    #### START METRIC LEARNING ####
-    ### pytorch-metric-learning stuff ###
-    train_loader = torch.utils.data.DataLoader(metric_dataset, collate_fn=multi_species_collate_fn,
-                                        batch_size=args.batch_size, shuffle=True)
-    
-    
-    distance = distances.CosineSimilarity()
-    reducer = reducers.ThresholdReducer(low = 0)
-    
-    
-    # TripletMarginMMDLoss
-    loss_func = losses.TripletMarginLoss(margin = 0.2,
-                            distance = distance, reducer = reducer)
+    xfer_dataset = dataset
 
-    mining_func = miners.TripletMarginMiner(margin = 0.2,
-                            distance = distance, type_of_triplets = "semihard",
-                            miner_type = "cross_species")
-    print("***STARTING METRIC TRAINING***")
-    all_indices_counts = pd.DataFrame(columns=["Epoch", "Triplet", "Count"])
-    
-    scores_df = pd.DataFrame(columns=["epoch", "score", "type"] + list(sorted_species_names))
-    batch_size_multiplier = 1
-    for epoch in range(1, args.epochs+1):
-        epoch_indices_counts = {}
-        
-               
-        train(metric_model, loss_func, mining_func, device,
-              train_loader, optimizer, epoch, args.mnn, 
-              sorted_species_names, use_ref_labels=args.use_ref_labels, indices_counts=epoch_indices_counts, 
-              equalize_triplets_species = args.equalize_triplets_species)
-        epoch_df = pd.DataFrame.from_records(list(epoch_indices_counts.items()), columns=["Triplet", "Count"])
-        epoch_df["Epoch"] = epoch
-        all_indices_counts = pd.concat((all_indices_counts, epoch_df))
-        
-        if epoch%args.polling_freq==0:
-            if use_batch_labels:
-                train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(\
-                    test_dataset, metric_model, device, use_batch_labels)
-    
-                adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                        train_macrogenes.cpu().numpy(), train_ref, 
-                                        celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names)  
-            else:
-                train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(test_metric_dataset, \
-                                                                                     metric_model, device, use_batch_labels)
-                adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                                    train_macrogenes.cpu().numpy(), train_ref, 
-                                                    celltype_id_map, reftype_id_map, obs_names=all_obs_names)
-            if args.score_adatas:
-                lr_row = stop_conditions.logreg_epoch_score(adata, epoch)
-                scores_df = pd.concat((scores_df, pd.DataFrame([lr_row])), ignore_index=True)
-            mmd_row = stop_conditions.median_min_distance_score(adata, epoch)
-            scores_df = pd.concat((scores_df, pd.DataFrame([mmd_row])), ignore_index=True)
-                    
-        if epoch%args.polling_freq==0:
-            if use_batch_labels:
-                train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric( \
-                                                                       test_dataset, metric_model, device, use_batch_labels)
-    
-                adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                        train_macrogenes.cpu().numpy(), train_ref, 
-                                        celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names)  
-            else:
-                train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(test_metric_dataset, \
-                                                                                     metric_model, device, use_batch_labels)
-                adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                                    train_macrogenes.cpu().numpy(), train_ref, 
-                                                    celltype_id_map, reftype_id_map, obs_names=all_obs_names)
+    xfer_model = TransferModel(
+        input_dim=species_to_adata[args.species].n_vars,
+        num_macrogenes=train_macrogenes.shape[1],
+        dropout=0.1,
+        hidden_dim=hidden_dim,
+        embed_dim=model_dim,
+        guide_species=species_closest,
+        species_to_gene_idx=species_to_gene_idx_hv_trained,
+        vae=args.vae,
+    )
 
+    # Load the model parameters from:
+    # 1. the trained metric model (encoder)
+    # 2. the trained pretrain model (p_weights, cl_layer_norm)
+    # 3. the manual gene -> guide gene approach above (guide_weights, guide_layer_norm)
+    # The latter could be further trained later on with an appropriate triplet loss.
+    xfer_state_dict = torch.load(args.metric_model_path)
+    # Copy the guide gene -> macrogene weights for all species
+    xfer_state_dict['p_weights'] = deepcopy(pretrain_state_dict['p_weights'])
+    # Copy the gene -> guide gene weights from above
+    xfer_state_dict['guide_weights'] = torch.tensor(species_genes_scores_closest_norm.T)
+    # set normalisation for guide gene layer: no bias, everytihng must sum to one
+    # FIXME: ...is this even making any sense? It's the weights that shuould be normalised, not the output
+    xfer_state_dict['guide_layer_norm.weight'] = torch.ones(species_genes_scores_closest_norm.shape[1])
+    xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(species_genes_scores_closest_norm.shape[1])
 
-            # NOTE: added by @iosonofabio to fix too long file names with many species
-            if len(run_name) > 50:
-                ml_intermediate_fn = f'adata_ep_{epoch}.h5ad'
-            else:
-                ml_intermediate_fn = f'{run_name}_ep_{epoch}.h5ad'
+    xfer_model.load_state_dict(xfer_state_dict)
 
-            ml_intermediate_path = metric_dir / ml_intermediate_fn
-            adata.write(ml_intermediate_path)
-            
-            if args.score_adatas:
-                print(f"***Metric Learning Epoch {epoch} Scores***")
-                lr_cross_row = {}
-                lr_cross_scores = get_all_scores(ml_intermediate_path, args.ct_map_path, score_column, 
-                               sorted_species_names[0], sorted_species_names[1], num_scores=1)
-                lr_cross_row["epoch"] = epoch
-                lr_cross_row["type"] = "cross_lr"
-                lr_cross_row["score"] = lr_cross_scores["species_2_logreg_accuracy"]
-                scores_df = pd.concat((scores_df, pd.DataFrame([lr_cross_row])), ignore_index=True)
-            
      # Write outputs to file
-    if args.metric_model_path != None:
-        # Save the pretraining model if asked to
-        print(f"Saving Metric Model to {args.metric_model_path}")
-        torch.save(metric_model.state_dict(), args.metric_model_path)
+    if args.xfer_model_path != None:
+        # Save the transfer model if asked to
+        print(f"Saving Transfer Model to {args.xfer_model_path}")
+        torch.save(xfer_model.state_dict(), args.xfer_model_path)
 
-    print("Saving Final AnnData")
+    # TODO:
+    #if (not args.unfreeze_macrogenes):
+    #else:
+
+    xfer_model.to(device)
+
     if use_batch_labels:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(\
-            test_dataset, metric_model, device, use_batch_labels)
-
-        adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                train_macrogenes.cpu().numpy(), train_ref, 
-                                celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names)  
+        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(
+            xfer_dataset, xfer_model, device, use_batch_labels,
+        )
+        adata = create_output_anndata(
+            train_emb, train_lab, train_species,
+            train_macrogenes.cpu().numpy(), train_ref,
+            celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names,
+        )
     else:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(test_metric_dataset, \
-                                                                             metric_model, device, use_batch_labels)
-        adata = create_output_anndata(train_emb, train_lab, train_species, 
-                                            train_macrogenes.cpu().numpy(), train_ref, 
-                                            celltype_id_map, reftype_id_map, obs_names=all_obs_names)
+        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(
+            xfer_dataset, xfer_model, device, use_batch_labels,
+        )
+        adata = create_output_anndata(
+            train_emb, train_lab, train_species,
+            train_macrogenes.cpu().numpy(), train_ref,
+            celltype_id_map, reftype_id_map, obs_names=all_obs_names,
+        )
 
-    # NOTE: added by @iosonofabio to fix too long file names with many species
     if len(run_name) > 50:
         final_adata_fn = "final_adata.h5ad"
-        triplets_fn = "triplets.csv"
-        epoch_scores_fn = "epoch_scores.csv"
-        celltype_id_fn = "celltype_id.pkl"
     else:
         final_adata_fn = f'{run_name}.h5ad'
-        triplets_fn = f'{run_name}_triplets.csv'
-        epoch_scores_fn = f'{run_name}_epoch_scores.csv'
-        celltype_id_fn = f'{run_name}_celltype_id.pkl'
-
 
     final_path = metric_dir / final_adata_fn
     adata.write(final_path)
     
-    final_path_triplets = metric_dir / triplets_fn
-    all_indices_counts.to_csv(final_path_triplets, index=False)
-    
-    final_path_epoch_scores = metric_dir / epoch_scores_fn
-    scores_df.to_csv(final_path_epoch_scores, index=False)
-    
-    final_path_ctid = metric_dir / celltype_id_fn
-    with open(final_path_ctid, "wb+") as f:
-        pickle.dump(celltype_id_map, f)
-    
-    if args.score_adatas:
-        print(f"***Final Scores***")
-        get_all_scores(final_path, args.ct_map_path, score_column, 
-                       sorted_species_names[0], sorted_species_names[1], num_scores=1)
     print(f"Final AnnData Path: {final_path}")
-    print(f"Final Triplets csv Path: {final_path_triplets}")
-    print(f"Final Epoch scores csv Path: {final_path_epoch_scores}")
-    print(f"Final celltype_id Path: {final_path_ctid}")
 
 
 if __name__ == '__main__':
@@ -1036,7 +925,7 @@ if __name__ == '__main__':
     
     # Pretrain Arguments
     parser.add_argument('--pretrain_model_path', type=str, required=True,
-                        help='Path to save/load a pretraining model to')
+                        help='Path to load a pretraining model from')
     parser.add_argument('--pretrain_batch_size', type=int,
                         help='pretrain batch size')
     
@@ -1049,7 +938,10 @@ if __name__ == '__main__':
                         help='batch size')
 
     parser.add_argument('--metric_model_path', type=str, required=True,
-                        help='Path to save/load a metric (macrogene -> embedding) model to')
+                        help='Path to load a metric (macrogene -> embedding) model from')
+
+    parser.add_argument('--xfer_model_path', type=str,
+                        help='Path to store the transfer learning model to')
     
     # Defaults
     parser.set_defaults(
