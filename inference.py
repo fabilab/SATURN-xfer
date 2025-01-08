@@ -2,6 +2,7 @@
 Created on Nov 7, 2022
 
 @author: Yanay Rosen
+@author: Fabio Zanini (2024-2025)
 '''
 
 
@@ -53,10 +54,18 @@ import random
 
 def train(
     model, loss_func, mining_func, device,
-    train_loader, optimizer, epoch, mnn, 
-    sorted_species_names, use_ref_labels=False, indices_counts={}, equalize_triplets_species=False):
+    train_loader,
+    optimizer,
+    epoch,
+    mnn, 
+    sorted_species_names,
+    guide_species,
+    use_ref_labels=False,
+    indices_counts={},
+    equalize_triplets_species=False,
+):
     '''
-    Train one epoch for a SATURN model with Metric Learning
+    Train one epoch for a model with Transfer Learning
     
     Keyword arguments:
     model -- the pretrain model, class is saturnMetricModel
@@ -73,43 +82,56 @@ def train(
     
     '''
     
+    # Set the model in training mode, i.e. generating the autograds (only for the free parameters)
     model.train()
     torch.autograd.set_detect_anomaly(True)
     for batch_idx, batch_dict in enumerate(train_loader):
+        # flatten grad for each batch, i.e. optimise them independently as if distinct epochs
         optimizer.zero_grad()
         embs = []
         labs = []
         spec = []
         ref_labs = []
+
+        # NOTE: during xfer learning, we have two species, a new to be embedded and a guide which is already embedded
         for species, (data, labels, ref_labels, _) in batch_dict.items():
             if data is None:
                 continue
             data, labels, ref_labels = data.to(device), labels.to(device), ref_labels.to(device)
             
-            embeddings = model(data, species)
+            # Guide species is already embedded
+            if species == guide_species:
+                embeddings = data
+            else:
+                embeddings = model(data, species)
             embeddings = F.normalize(embeddings)
             embs.append(embeddings)
             labs.append(labels)
             ref_labs.append(ref_labels)
             spec.append(np.argmax(np.array(sorted_species_names) == species) * torch.ones_like(labels))
-            
+
+        # Concat the embedding and metadta from both guide and new species
         embeddings = torch.cat(embs)
         labels = torch.cat(labs)
         ref_labels = torch.cat(ref_labs)
-        
         species = torch.cat(spec)
+
+        # Make indices_tuple to instruct the triplet loss
         if use_ref_labels:
             indices_tuple = mining_func(embeddings, labels, species, mnn=mnn, ref_labels=ref_labels)
         else:
             indices_tuple = mining_func(embeddings, labels, species, mnn=mnn)
             
         indices_mapped = [labels[i] for i in indices_tuple] # map to labels for only the purpose of writing to triplets file
-        
         for j in range(len(indices_mapped[0])):
             key = f"{indices_mapped[0][j]},{indices_mapped[1][j]},{indices_mapped[2][j]}"
             indices_counts[key] = indices_counts.get(key, 0) + 1
+
+        # Compute loss function based on the batch's embeddings (output) and metadata (labels)
         loss = loss_func(embeddings, labels, indices_tuple, embs_list=embs)
         
+        # This is a special option in case one worries about inbalances. Honestly the model has
+        # worse issues with that in the autobatcher ATM.
         if equalize_triplets_species:
             species_mapped = [species[i] for i in indices_tuple] # a,p,n species vectors
             a_spec = species_mapped[0]
@@ -129,6 +151,7 @@ def train(
             # WEIGHT THE LOSS BY THE NUMBER OF TRIPLETS MINED PER SPECIES
             loss = torch.mul(torch.mul(loss, a_bal_inv), p_bal_inv).mean()                                         
                                                        
+        # ...and finally (auto)compute the backward gradient to update the model parameters
         loss.backward()
         optimizer.step()
 
@@ -136,138 +159,6 @@ def train(
             print("Epoch {} Iteration {}: Loss = {}, Number of mined triplets "
                   "= {}".format(epoch, batch_idx, loss,
                                 mining_func.num_triplets))
-
-def pretrain_saturn(model, pretrain_loader, optimizer, device, nepochs, 
-                       sorted_species_names, balance=False, use_batch_labels=False, embeddings_tensor=None):
-    '''
-    Pretrain a SATURN model with a conditional autoencoder
-
-    Keyword arguments:
-    model -- the pretrain model, class is saturnPretrainModel
-    pretrain_loader -- train loader, returns the count values
-    optimizer -- torch optimizer for model
-    device -- the current torch device
-    nepochs -- how many epochs to pretrain for
-    sorted_species_names -- names of the species that are being aligned
-    balance -- if we should balance the loss by cell label abundancy
-    use_batch_labels -- if we add batch labels as a categorical covariate
-    embeddings_tensor -- dictionary containing species:protein embeddings
-    '''
-    
-    
-    print('Pretraining...')
-    model.train();
-    
-    if balance:
-        all_labels = []
-        # Count the label frequency
-        for batch_idx, batch_dict in enumerate(pretrain_loader):
-            for species in sorted_species_names:
-                (_, labels, _, _) = batch_dict[species]
-                if labels is None:
-                    continue
-                labels = labels.cpu()
-                all_labels.append(labels)
-        all_labels = torch.cat(all_labels)
-        unique_labels, label_counts = torch.unique(all_labels, return_counts=True)
-
-        label_weights = label_counts / torch.sum(label_counts) # frequencies
-        label_weights = 1 / label_weights # inverse frequencies
-        
-        max_weight = torch.tensor(unique_labels.shape[0])
-        
-        label_weights = torch.min(max_weight, label_weights) / max_weight # cap the inverse frequency 
-
-        label_weights = label_weights[unique_labels] # make sure it is in the right order
-                
-    
-    pbar = tqdm(np.arange(1, nepochs+1))
-    all_ave_losses = {}
-    for species in sorted_species_names:
-        all_ave_losses[species] = []
-    for epoch in pbar:
-        model.train();
-        epoch_ave_losses = {}
-        for species in sorted_species_names:
-            epoch_ave_losses[species] = []
-        if model.vae:
-            kld_weight = get_kld_cycle(epoch - 1, period=50)
-        else:
-            kld_weight = 0
-        epoch_triplet_loss = []
-
-        for batch_idx, batch_dict in enumerate(pretrain_loader):
-            optimizer.zero_grad()
-
-            batch_loss = 0
-            for species in np.random.choice(sorted_species_names, size=len(sorted_species_names), replace=False):
-                # NOTE: added by @iosonofabio, this seems to be the intent from 3 lines below
-                # FIXME: this seems to create problems...
-                if species not in batch_dict:
-                    continue
-
-                (data, labels, refs, batch_labels) = batch_dict[species]
-                
-                if data is None:
-                    continue
-                spec_loss = 0
-                if use_batch_labels:
-                    data, labels, refs, batch_labels = data.to(device), labels.to(device),\
-                                                        refs.to(device), batch_labels.to(device)
-                    encoder_input, encoded, mus, log_vars, px_rates, px_rs, px_drops = model(data, species, batch_labels)
-                else:
-                    data, labels, refs = data.to(device), labels.to(device), refs.to(device)
-                
-                    encoder_input, encoded, mus, log_vars, px_rates, px_rs, px_drops = model(data, species)
-
-                if model.vae:
-                    if mus.dim() != 2:
-                        mus = mus.unsqueeze(0)
-                    if log_vars.dim() != 2:
-                        log_vars = log_vars.unsqueeze(0)
-                if px_rates.dim() != 2:
-                    px_rates = px_rates.unsqueeze(0)
-                if px_rs.dim() != 2:
-                    px_rs = px_rs.unsqueeze(0)
-                if px_drops.dim() != 2:
-                    px_drops = px_drops.unsqueeze(0)
-                
-                gene_weights = model.p_weights.exp()
-                if balance:
-                    batch_weights = label_weights[labels].to(device)
-                    l = model.loss_vae(data, mus, 
-                           log_vars, kld_weight, 
-                           px_rates, px_rs, px_drops, batch_weights) # This loss also works for non vae loss
-                else:
-                    l = model.loss_vae(data, mus, 
-                           log_vars, kld_weight, 
-                           px_rates, px_rs, px_drops) # This loss also works for non vae loss
-
-                spec_loss = l["loss"] / data.shape[0]
-                epoch_ave_losses[species].append(float(spec_loss.detach().cpu()))
-                batch_loss += spec_loss
-            
-            l1_loss = model.l1_penalty * model.lasso_loss(model.p_weights.exp())
-            rank_loss = model.pe_sim_penalty * model.gene_weight_ranking_loss(model.p_weights.exp(), embeddings_tensor)
-           
-            batch_loss += l1_loss + rank_loss
-            optimizer.zero_grad()
-            batch_loss.backward()
-            optimizer.step()
-        if model.vae:
-            loss_string = [f"Epoch {epoch}: KLD weight: {kld_weight}: L1 Loss {l1_loss.detach()} Rank Loss {rank_loss.detach()}"]
-        else:
-            loss_string = [f"Epoch {epoch}: L1 Loss {l1_loss.detach()} Rank Loss {rank_loss.detach()}"]
-
-        for species in sorted_species_names:
-            loss_string += [f"Avg Loss {species}: {round(np.average(epoch_ave_losses[species]))}"]
-            
-        loss_string = ", ".join(loss_string)
-
-        pbar.set_description(loss_string)
-        for species in sorted_species_names:
-            all_ave_losses[species].append(np.mean(epoch_ave_losses[species]))
-    return model
 
 
 def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names=None):
@@ -517,12 +408,8 @@ def inferrer(args):
     unique_ref_types = set()
     for adata in species_to_adata.values():
         unique_ref_types = (unique_ref_types | set(adata.obs[args.ref_label_col]))
-
     unique_ref_types = sorted(unique_ref_types)
-
     reftype_id_map = {ref_type: index for index, ref_type in enumerate(unique_ref_types)}
-
-    
     for adata in species_to_adata.values():
         adata.obs["ref_labels"] = pd.Categorical(
             values=[reftype_id_map[ref_type] for ref_type in adata.obs[args.ref_label_col]]
@@ -818,16 +705,155 @@ def inferrer(args):
     xfer_model.load_state_dict(xfer_state_dict)
 
      # Write outputs to file
-    if args.xfer_model_path != None:
+    if (not args.train) and (args.xfer_model_path is not None):
         # Save the transfer model if asked to
         print(f"Saving Transfer Model to {args.xfer_model_path}")
         torch.save(xfer_model.state_dict(), args.xfer_model_path)
 
-    # TODO:
-    #if (not args.unfreeze_macrogenes):
-    #else:
-
     xfer_model.to(device)
+
+    # If requested, train the xfer model
+    # NOTE: Only the first layer, which projects onto the closest species, is trained here.
+    if args.train:
+
+        # NOTE: The key thing is that to make the triplet loss meaningful, at least unidirectionally,
+        # we must run the metric (xfer) training with at least two species (the guide species is the
+        # obvious candidate AND also shuffle to ensure both species are found in EACH batch. For now
+        # we just use autobatching as the rest of SATURN but we'll have to fix both anyway
+        if args.trained_adata_path is None:
+            raise ValueError("Must provide a trained adata path for training the transfer model.")
+
+        adata_trained = sc.read(args.trained_adata_path)
+        # NOTE: this is a sanity check to ensure that the guide species is in the training set
+        if species_closest not in adata_trained.obs['species'].unique():
+            raise ValueError(f"Guide species {species_closest} not found in training set.")
+
+        # Restrict the adata to the guide species
+        adata_guide = adata_trained[adata_trained.obs['species'] == species_closest]
+        adata_guide.obs['species_type_label'] = adata_guide.obs['labels']
+        adata_guide.obs[args.ref_label_col] = adata_guide.obs['ref_labels']
+
+        # TODO: check that the zero-shot is perfect on a known species
+        if False:
+            X_for_zero_shot = species_to_adata[args.species].X
+            train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(
+                xfer_dataset, xfer_model, device, use_batch_labels,
+            )
+            adata_zero_shot = create_output_anndata(
+                train_emb, train_lab, train_species,
+                train_macrogenes.cpu().numpy(), train_ref,
+                celltype_id_map, reftype_id_map, obs_names=all_obs_names,
+            )
+        # Build dataset for data loader.
+        # NOTE: the new data is in HVG space, the guide one in metric embedding space, but that's taken care of
+        # in the train function: only the new data is passed through the model.
+        species_to_adata_xfer = {
+            args.species: species_to_adata[args.species],
+            species_closest: adata_guide,
+        }
+        sorted_species_names_xfer = sorted(species_to_adata_xfer.keys())
+
+        # Create the "truth_labels" column which is an integer representation of all cell types
+        unique_cell_types_xfer = set()
+        for adata in species_to_adata_xfer.values():
+            unique_cell_types_xfer = (unique_cell_types_xfer | set(adata.obs["species_type_label"]))
+        unique_cell_types_xfer = sorted(unique_cell_types_xfer)
+        celltype_id_map_xfer = {cell_type: index for index, cell_type in enumerate(unique_cell_types_xfer)}
+        for adata in species_to_adata_xfer.values():
+            adata.obs["truth_labels"] = pd.Categorical(
+                values=[celltype_id_map_xfer[cell_type] for cell_type in adata.obs["species_type_label"]]
+            )
+
+        # Create the "ref_labels" column which is also an integer representation of all cell types
+        unique_ref_types_xfer = set()
+        for adata in species_to_adata_xfer.values():
+            unique_ref_types_xfer = (unique_ref_types_xfer | set(adata.obs[args.ref_label_col]))
+        unique_ref_types_xfer = sorted(unique_ref_types_xfer)
+        reftype_id_map_xfer = {ref_type: index for index, ref_type in enumerate(unique_ref_types_xfer)}
+        for adata in species_to_adata_xfer.values():
+            adata.obs["ref_labels"] = pd.Categorical(
+                values=[reftype_id_map_xfer[ref_type] for ref_type in adata.obs[args.ref_label_col]]
+            )
+
+        # Make the guide species data loader
+        if use_batch_labels: # we have a batch column to use for the pretrainer
+            train_dataset = ExperimentDatasetMultiEqual(
+                all_data = species_to_adata_xfer,
+                all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_xfer.items()},
+                all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
+                all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata_xfer.items()}
+            )
+        else:
+            train_dataset = ExperimentDatasetMultiEqual(
+                all_data = species_to_adata_xfer,
+                all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_xfer.items()},
+                all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
+                all_batch_labs = {}
+            )
+
+        # Load data with shuffling
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            collate_fn=multi_species_collate_fn,
+            batch_size=1024,
+            shuffle=True,
+        )
+
+        # freeze everything except the first encoder (gene -> guide gene)
+        for parameter in xfer_model.parameters():
+            parameter.requires_grad = False
+        xfer_model.guide_weights.requires_grad = True
+        xfer_model.guide_layer_norm.requires_grad = True
+        # Create the optimizer
+        optimizer = optim.Adam(xfer_model.parameters(), lr=args.metric_lr)
+
+        distance = distances.CosineSimilarity()
+        reducer = reducers.ThresholdReducer(low = 0)
+
+        # TripletMarginMMDLoss
+        loss_func = losses.TripletMarginLoss(
+            margin=0.2,
+            distance=distance,
+            reducer=reducer,
+        )
+
+        mining_func = miners.TripletMarginMiner(
+            margin=0.2,
+            distance=distance,
+            type_of_triplets="semihard",
+            miner_type="cross_species",
+        )
+
+        print("***STARTING TRANSFER LEARNING TRAINING***")
+        all_indices_counts = pd.DataFrame(columns=["Epoch", "Triplet", "Count"])
+        scores_df = pd.DataFrame(columns=["epoch", "score", "type"] + list(sorted_species_names_xfer))
+        for epoch in range(1, args.epochs+1):
+            epoch_indices_counts = {}
+            train(
+                xfer_model,
+                loss_func,
+                mining_func,
+                device,
+                train_loader,
+                optimizer,
+                epoch,
+                args.mnn,
+                sorted_species_names_xfer,
+                species_closest,
+                use_ref_labels=args.use_ref_labels,
+                indices_counts=epoch_indices_counts,
+                equalize_triplets_species=args.equalize_triplets_species,
+            )
+
+            # Collect output metrics for this one epoch
+            epoch_df = pd.DataFrame.from_records(list(epoch_indices_counts.items()), columns=["Triplet", "Count"])
+            epoch_df["Epoch"] = epoch
+            all_indices_counts = pd.concat((all_indices_counts, epoch_df))
+
+        if args.xfer_model_path is not None:
+            # Save the transfer model if asked to
+            print(f"Saving trained Transfer Model to {args.xfer_model_path}")
+            torch.save(xfer_model.state_dict(), args.xfer_model_path)
 
     if use_batch_labels:
         train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(
@@ -922,26 +948,28 @@ if __name__ == '__main__':
     parser.add_argument('--scale_expression', type=bool, nargs='?', const=True,
                         help='Whether to scale the gene expression to zero mean and unit variance')
     
-    
-    # Pretrain Arguments
-    parser.add_argument('--pretrain_model_path', type=str, required=True,
-                        help='Path to load a pretraining model from')
-    parser.add_argument('--pretrain_batch_size', type=int,
-                        help='pretrain batch size')
-    
     # Metric Learning Arguments
-    parser.add_argument('--unfreeze_macrogenes', type=bool, nargs='?', const=True,
-                        help='Let Metric Learning Modify macrogene weights')
     parser.add_argument('--use_ref_labels', type=bool, nargs='?', const=True, 
                     help='Use reference labels when aligning')
     parser.add_argument('--batch_size', type=int,
                         help='batch size')
+    parser.add_argument('--equalize_triplets_species', type=bool, nargs='?', const=True,
+                        help='Balance species\' weighting in the metric learning model')
+    parser.add_argument('--train', action='store_true',
+                        help="Train the transfer model instead of zero-shot inference.")
+    parser.add_argument('--trained_adata_path', type=str,
+                        help="If training is requested, this path must contained the trained adata for at least the guide species.")
 
+    # Model paths
+    parser.add_argument('--pretrain_model_path', type=str, required=True,
+                        help='Path to load a pretraining model from')
+    parser.add_argument('--pretrain_batch_size', type=int,
+                        help='pretrain batch size')
     parser.add_argument('--metric_model_path', type=str, required=True,
                         help='Path to load a metric (macrogene -> embedding) model from')
-
     parser.add_argument('--xfer_model_path', type=str,
                         help='Path to store the transfer learning model to')
+
     
     # Defaults
     parser.set_defaults(
@@ -979,8 +1007,10 @@ if __name__ == '__main__':
         score_ref_labels=False,
         tissue_subset=None,
         tissue_column="tissue_type",
+        equalize_triplets_species=False,
         hv_span=0.3,
-        centroid_score_func="default"
+        centroid_score_func="default",
+        train=False,
     )
 
     args = parser.parse_args()

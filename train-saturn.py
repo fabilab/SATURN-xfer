@@ -822,13 +822,15 @@ def trainer(args):
     
     #### START METRIC LEARNING ####
     ### pytorch-metric-learning stuff ###
-    train_loader = torch.utils.data.DataLoader(metric_dataset, collate_fn=multi_species_collate_fn,
-                                        batch_size=args.batch_size, shuffle=True)
-    
+    train_loader = torch.utils.data.DataLoader(
+        metric_dataset,
+        collate_fn=multi_species_collate_fn,
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
     
     distance = distances.CosineSimilarity()
     reducer = reducers.ThresholdReducer(low = 0)
-    
     
     # TripletMarginMMDLoss
     loss_func = losses.TripletMarginLoss(
@@ -853,7 +855,7 @@ def trainer(args):
         epoch_indices_counts = {}
                
         train(metric_model, loss_func, mining_func, device,
-              train_loader, optimizer, epoch, args.mnn, 
+              train_loader, optimizer, epoch, args.mnn,
               sorted_species_names, use_ref_labels=args.use_ref_labels, indices_counts=epoch_indices_counts, 
               equalize_triplets_species = args.equalize_triplets_species)
 
