@@ -27,7 +27,7 @@ import torch.optim as optim
 import numpy as np
 import utils.logging_presets as logging_presets
 import record_keeper
-from data.gene_embeddings import load_gene_embeddings_adata, load_gene_embeddings
+from data.gene_embeddings import load_gene_embeddings_adata, load_gene_embeddings_one_species
 from data.multi_species_data import ExperimentDatasetMulti, multi_species_collate_fn, ExperimentDatasetMultiEqualCT
 from data.multi_species_data import ExperimentDatasetMultiEqual
 
@@ -369,11 +369,18 @@ def inferrer(args):
     ct = 0
     for species in sorted_species_names:
         adata = species_to_adata[species]
+        # NOTE: data must be normalised (e.g. to cptt) for HVG calculation
+        adata.layers['raw'] = adata.X.copy()
+        sc.pp.normalize_total(adata, target_sum=1e4)
         if use_batch_labels:
-            sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=args.hv_genes, \
-                                        batch_key=args.non_species_batch_col, span=args.hv_span)  # Expects Count Data
+            sc.pp.highly_variable_genes(
+                adata, flavor='seurat_v3', n_top_genes=args.hv_genes,
+                batch_key=args.non_species_batch_col, span=args.hv_span,
+            )  # Expects Count Data
         else:
             sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=args.hv_genes)  # Expects Count Data
+        # Back to raw counts it goes, this sends the normalised counts to garbage collection
+        adata.X = adata.layers.pop('raw')
         hv_index = adata.var["highly_variable"]
         species_to_adata[species] = adata[:, hv_index]
         species_to_gene_embeddings[species] = species_to_gene_embeddings[species][hv_index]
@@ -444,13 +451,13 @@ def inferrer(args):
     # returns a tensor, not a dictionary
     # TODO: we could load only the genes we want, that'd be easier
     embedding_path_closest = pd.read_csv(args.training_csv_path, index_col="species").at[species_closest, "embedding_path"]
-    gene_embedding_dict_guide = load_gene_embeddings(
+    gene_embedding_dict_guide = load_gene_embeddings_one_species(
         species=species_closest,
         genes=hvgs_guide_plain,
         embedding_model=args.embedding_model,
         embedding_path=embedding_path_closest,
     )
-    gene_embeddings_closest_hvg = torch.tensor([gene_embedding_dict_guide[gn] for gn in hvgs_guide_plain])
+    gene_embeddings_closest_hvg = torch.stack([gene_embedding_dict_guide[gn] for gn in hvgs_guide_plain])
 
     # Get the matix matching genes to the guide species genes. "one-hot" means winner takes all (two 1st prizes for equal distance)
     # This is the only one of the three currently used metrics that becomes exact in the limit of inferring a species that is
@@ -474,6 +481,9 @@ def inferrer(args):
 
     print("***STARTING TRANSFER LEARNING***")
     # Set a few infra things
+    args.dir_ = args.work_dir + args.log_dir + \
+                'test'+str(args.model_dim)+\
+                '_data_'
     df_names = []
     for species in sorted_species_names:
         p = species_to_path[species]
@@ -499,10 +509,10 @@ def inferrer(args):
      # Copy the gene -> guide gene weights from above. This needs not be diagonal even for identical
     # species due to ordering of genes (the projection is onto HVG space of the target species, because
     # those are the only genes with a macrogene weight)..
-    xfer_state_dict['guide_weights'] = torch.tensor(matrix_match_gene_guides_norm.T)
+    xfer_state_dict['guide_weights'] = torch.tensor(matrix_match_gene_guides_norm.T.astype(np.float32)).to(device)
     # leave an open multiplier for the guide gene space, decide later whether to freeze it or not
-    xfer_state_dict['guide_layer_norm.weight'] = torch.ones(matrix_match_gene_guides_norm.shape[1])
-    xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(matrix_match_gene_guides_norm.shape[1])   # The latter could be further trained later on with an appropriate triplet loss.
+    xfer_state_dict['guide_layer_norm.weight'] = torch.ones(matrix_match_gene_guides_norm.shape[1]).to(device)
+    xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(matrix_match_gene_guides_norm.shape[1]).to(device)   # The latter could be further trained later on with an appropriate triplet loss.
     # Copy the guide gene -> macrogene weights and normalistion bias for all species
     pretrain_state_dict = torch.load(args.pretrain_model_path)
     xfer_state_dict['p_weights'] = deepcopy(pretrain_state_dict['p_weights'])
@@ -519,15 +529,17 @@ def inferrer(args):
 
     xfer_model = TransferModel(
         input_dim=species_to_adata[args.species].n_vars,
-        num_macrogenes=train_macrogenes.shape[1],
+        num_macrogenes=xfer_state_dict['p_weights'].shape[0],
         dropout=0.1,
-        hidden_dim=hidden_dim,
-        embed_dim=model_dim,
+        hidden_dim=xfer_state_dict['encoder.0.0.bias'].shape[0],
+        embed_dim=xfer_state_dict['encoder.1.1.bias'].shape[0],
         guide_species=species_closest,
         species_to_gene_idx=species_to_gene_idx_hv_trained,
         vae=args.vae,
     )
+    # NOTE: both parameters from the dict and model need to be cast onto the GPU separately
     xfer_model.load_state_dict(xfer_state_dict)
+    xfer_model.to(device)
 
     print("***ZERO-SHOT INFERENCE***")
     if use_batch_labels: # we have a batch column to use for the pretrainer
@@ -577,8 +589,6 @@ def inferrer(args):
         # Save the transfer model if asked to
         print(f"Saving Transfer Model to {args.xfer_model_path}")
         torch.save(xfer_model.state_dict(), args.xfer_model_path)
-
-    xfer_model.to(device)
 
     # If requested, train the xfer model
     # NOTE: Only the first encoder, which projects onto the closest species, is trained here.

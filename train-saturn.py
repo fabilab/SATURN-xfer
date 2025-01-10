@@ -535,12 +535,20 @@ def trainer(args):
     species_to_gene_idx_hv = {}
     ct = 0
     for species in sorted_species_names:
+        print(species)
         adata = species_to_adata[species]
+        # NOTE: data must be normalised (e.g. to cptt) for HVG calculation
+        adata.layers['raw'] = adata.X.copy()
+        sc.pp.normalize_total(adata, target_sum=1e4)
         if use_batch_labels:
-            sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=args.hv_genes, \
-                                        batch_key=args.non_species_batch_col, span=args.hv_span)  # Expects Count Data
+            sc.pp.highly_variable_genes(
+                adata, flavor='seurat_v3', n_top_genes=args.hv_genes,
+                batch_key=args.non_species_batch_col, span=args.hv_span,
+            )  # Expects Count Data
         else:
             sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=args.hv_genes)  # Expects Count Data
+        # Back to raw counts it goes, this sends the normalised counts to garbage collection
+        adata.X = adata.layers.pop('raw')
         hv_index = adata.var["highly_variable"]
         species_to_adata[species] = adata[:, hv_index]
         species_to_gene_embeddings[species] = species_to_gene_embeddings[species][hv_index]

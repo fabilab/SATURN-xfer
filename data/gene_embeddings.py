@@ -122,7 +122,7 @@ def load_gene_embeddings_adata(adata: AnnData, species: list, embedding_model: s
     return adata, species_to_gene_embeddings
 
 
-def load_gene_embeddings_one_species(species: str, genes: Union[None, Sequence[str]] = None, embedding_model: str, embedding_path: Union[str, None] = None):
+def load_gene_embeddings_one_species(species: str, embedding_model: str, genes: Union[None, Sequence[str]] = None, embedding_path: Union[str, None] = None):
     """Load specific embeddings from one species"""
     if embedding_path is None:
         # Get embedding paths for the model
