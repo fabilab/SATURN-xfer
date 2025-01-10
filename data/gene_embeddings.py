@@ -1,6 +1,6 @@
 """Helper functions for loading pretrained gene embeddings."""
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Sequence, Union
 
 import torch
 
@@ -120,3 +120,25 @@ def load_gene_embeddings_adata(adata: AnnData, species: list, embedding_model: s
     }
 
     return adata, species_to_gene_embeddings
+
+
+def load_gene_embeddings_one_species(species: str, genes: Union[None, Sequence[str]] = None, embedding_model: str, embedding_path: Union[str, None] = None):
+    """Load specific embeddings from one species"""
+    if embedding_path is None:
+        # Get embedding paths for the model
+        species_to_gene_embedding_path = MODEL_TO_SPECIES_TO_GENE_EMBEDDING_PATH[embedding_model]
+        available_species = set(species_to_gene_embedding_path)
+
+        # Ensure embeddings are available for all species
+        if species not in available_species:
+            raise ValueError(f'The chosen species does not have gene embeddings: {species}')
+
+        # Load gene embeddings for desired species (and convert gene symbols to lower case)
+        embedding_dict = torch.load(species_to_gene_embedding_path[species])
+    else:
+        embedding_dict = torch.load(embedding_path)
+
+    if genes is not None:
+        embedding_dict = {key: val for key, val in embedding_dict.items() if key in genes}
+
+    return embedding_dict

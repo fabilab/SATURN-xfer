@@ -27,7 +27,7 @@ import torch.optim as optim
 import numpy as np
 import utils.logging_presets as logging_presets
 import record_keeper
-from data.gene_embeddings import load_gene_embeddings_adata
+from data.gene_embeddings import load_gene_embeddings_adata, load_gene_embeddings
 from data.multi_species_data import ExperimentDatasetMulti, multi_species_collate_fn, ExperimentDatasetMultiEqualCT
 from data.multi_species_data import ExperimentDatasetMultiEqual
 
@@ -47,7 +47,6 @@ from sklearn.cluster import KMeans
 from scipy.stats import rankdata
 import pickle
 from copy import deepcopy
-from score_adata import get_all_scores
 from utils import stop_conditions
 import random
 
@@ -103,7 +102,9 @@ def train(
             if species == guide_species:
                 embeddings = data
             else:
-                embeddings = model(data, species)
+                # We don't need the macrogene space info during training
+                # NOTE: this would change if we "unfreeze" the macrogenes, of course
+                _, embeddings = model(data, species)
             embeddings = F.normalize(embeddings)
             embs.append(embeddings)
             labs.append(labels)
@@ -204,19 +205,14 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
                     # NOTE: This is where inference is actually carried out (!)
                     # Calling the model looks like it's calling the forward function, wrapped in some no_grad magic
                     # NOTE: this is always ONE species at a time.
-                    encoder_inputs, encodeds, mus, log_var, px_rate, px_r, px_drop = model(data, species)
+                    encoder_inputs, encodeds = model(data, species)
 
                 # These are the outputs of the model and how we store them:
                 # 1. the encoded output (the embedding)
                 # 2. the projection onto macrogenes (encoder input)
                 # 3. metadata (species, labels, barch if requested)
-                if model.vae:
-                    for mu in mus:
-                        embs.append(mu.detach().cpu())
-                else:
-                    for encoded in encodeds:
-                        embs.append(encoded.detach().cpu())
-
+                for encoded in encodeds:
+                    embs.append(encoded.detach().cpu())
                 for encoder_input in encoder_inputs:
                     macrogenes.append(encoder_input.detach().cpu())
 
@@ -234,67 +230,6 @@ def get_all_embeddings(dataset, model, device, use_batch_labels=False, obs_names
     else:
         return torch.stack(embs).cpu().numpy(), np.array(labs), np.array(spec), torch.stack(macrogenes), np.array(refs)
 
-def get_all_embeddings_metric(dataset, model, device, use_batch_labels=False):
-    '''
-    Get the embeddings and other metadata for a trained SATURN model.
-
-    Keyword arguments:
-    model -- the trained model, class is SATURNMetricModel
-    dataset -- macrogene values
-    use_batch_labels -- if we add batch labels as a categorical covariate
-
-    Returns:
-        A few things including the embedded values (output of the full encoder) for both models.
-    '''
-    test_loader = torch.utils.data.DataLoader(
-        dataset,
-        collate_fn=multi_species_collate_fn,
-        batch_size=1024,
-        shuffle=False,
-    )
-
-    # NOTE: this is inference time, so we use a combo of model.eval and torch.no_grad
-    model.eval()
-    embs = []
-    macrogenes = []
-    labs = []
-    spec = []
-    refs = []
-    
-    if use_batch_labels:
-        batch_labs = []
-        
-    with torch.no_grad():
-        for batch_idx, batch_dict in tqdm(enumerate(test_loader), total=len(test_loader)):
-            for species, (data, labels, ref_labels, batch_labels) in batch_dict.items():
-                if data is None:
-                    continue
-                if use_batch_labels:
-                    data, labels, ref_labels, batch_labels = data.to(device), labels.to(device), \
-                                                             ref_labels.to(device), batch_labels.to(device)
-                else:
-                    data, labels, ref_labels = data.to(device), labels.to(device), ref_labels.to(device)
-
-                # This is where the inference (i.e. forward method) takes place.
-                # NOTE: this is always ONE species at a time.
-                encodeds = model(data, species)
-               
-                for encoded in encodeds:
-                    embs.append(encoded.detach().cpu())
-                # encoder input is just the data
-                for encoder_input in data:
-                    macrogenes.append(encoder_input.detach().cpu())
-                spec += [species] * data.shape[0]
-                labs = labs + list(labels.cpu().numpy())
-                refs = refs + list(ref_labels.cpu().numpy())
-                if use_batch_labels:
-                    batch_labs = batch_labs + list(batch_labels.cpu().numpy())
-    if use_batch_labels:
-        return torch.stack(embs).cpu().numpy(), np.array(labs), np.array(spec), torch.stack(macrogenes),\
-                                                                np.array(refs), np.array(batch_labs)
-    else:
-        return torch.stack(embs).cpu().numpy(), np.array(labs), np.array(spec), torch.stack(macrogenes), np.array(refs)           
-    
 
 def create_output_anndata(train_emb, train_lab, train_species, train_macrogenes, train_ref, celltype_id_map, reftype_id_map, use_batch_labels=False, batchtype_id_map=None, train_batch=None, obs_names=None):
     '''
@@ -330,11 +265,18 @@ def inferrer(args):
     '''
     Runs the inference pipeline
     '''
-    # data_df should have columns for df location
+
+    # Set some infra things
+    hooks = logging_presets.get_hook_container(record_keeper)
+    device = torch.device(args.device)
+    dt = str(datetime.now())[5:19].replace(' ', '_').replace(':', '-')
+
+    print("Load data")
     species_to_path = {args.species: args.in_adata_path}
     species_to_adata = {species:sc.read(path) for species,path in species_to_path.items()}
     species_to_embedding_paths = {args.species: args.in_embeddings_path}
         
+    print("Preprocess data")
     if args.tissue_subset is not None:
         for species in species_to_adata.keys():
             ad = species_to_adata[species]
@@ -365,32 +307,22 @@ def inferrer(args):
         adata.obs["species_type_label"] = species_specific_celltype
         all_obs_names += list(adata.obs_names)
     
+    print("Create truth, ref, and batch labels (as requested)")
     # Create mapping from cell type to ID
-    
     unique_cell_types = set()
     for adata in species_to_adata.values():
         unique_cell_types = (unique_cell_types | set(adata.obs["species_type_label"]))
-    
     unique_cell_types = sorted(unique_cell_types)
-    
     celltype_id_map = {cell_type: index for index, cell_type in enumerate(unique_cell_types)}
-
     for adata in species_to_adata.values():
         adata.obs["truth_labels"] = pd.Categorical(
             values=[celltype_id_map[cell_type] for cell_type in adata.obs["species_type_label"]]
         )
-    
+
+    # If we are using batch labels, add them as a column in our output anndatas and pass them as a categorical covariate to pretraining
     num_batch_labels = 0
     use_batch_labels = args.non_species_batch_col is not None
-    
-    if args.score_ref_labels:
-        score_column = "ref_labels"
-    else:
-        score_column = "labels2"
-        
-    # If we are using batch labels, add them as a column in our output anndatas and pass them as a categorical covariate to pretraining
     if use_batch_labels:
-        
         unique_batch_types = set()
         for adata in species_to_adata.values():
             unique_batch_types = (unique_batch_types | set(adata.obs[args.non_species_batch_col]))
@@ -431,7 +363,8 @@ def inferrer(args):
     
     sorted_species_names = sorted(species_to_gene_embeddings.keys())
     
-    # Get highly variable genes and subset the adatas and embeddings
+    print("Filter high-variable genes (hard feature selection)")
+    # NOTE: perhaps there would be a better way to do this, using marker genes or Fatemeh's algo
     species_to_gene_idx_hv = {}
     ct = 0
     for species in sorted_species_names:
@@ -458,7 +391,7 @@ def inferrer(args):
     # stacked embeddings
     X = torch.cat([species_to_gene_embeddings[species] for species in sorted_species_names])
     
-    # Load the centroid weights
+    print("Load the centroid weights")
     with open(args.centroids_init_path, "rb") as f:
         tmp = pickle.load(f)
         species_genes_scores_trained = tmp['scores']
@@ -466,6 +399,8 @@ def inferrer(args):
         centroid_score_func = tmp.get('score_func', args.centroid_score_func)
         sorted_species_names_trained = tmp['sorted_species_names']
         species_to_gene_idx_hv_trained = tmp['species_to_gene_idx_hv']
+        # These are the genes from all species on which the model was trained,
+        # which inculde only HVGs anyway
         all_gene_names_trained = tmp['all_gene_names']
         del tmp
     print("Loaded centroids and existing scores")
@@ -483,6 +418,7 @@ def inferrer(args):
     if args.guide_species is not None:
         species_closest = args.guide_species
     else:
+        print("Find the closest species within the training set")
         metric = {}
         for species in sorted_species_names_trained:
             centroid_weights_trained_species = torch.stack(
@@ -496,82 +432,48 @@ def inferrer(args):
         metric = pd.Series(metric)
         species_closest = metric.idxmin()
         del metric, centroid_weights_trained_species, cdist_species, dis_closest, nconserved,  dis_mean
-
-    print(f"Closest species within the training set: {species_closest}.")
+        print(f"Closest species within the training set: {species_closest}.")
 
     print("Connect genes of new species with genes of closest species for inference")
-    genes_closest = [gn for gn in all_gene_names_trained if gn.startswith(species_closest)]
+    hvgs_guide_species = [gn for gn in all_gene_names_trained if gn.startswith(species_closest)]
+    # Strip the "species-" part in front of each gene name
+    hvgs_guide_plain = [x[len(species_closest) + 1:] for x in hvgs_guide_species]
 
-    tmp = pd.read_csv(args.training_csv_path, index_col="species")
-    adata_path_closest = tmp.at[species_closest, "path"]
-    embedding_path_closest = tmp.at[species_closest, "embedding_path"]
-    adata_closest = sc.read(adata_path_closest)
-
-    adata_closest, species_gene_embeddings_closest = load_gene_embeddings_adata(
-        adata=adata_closest,
-        species=[species_closest],
+    # Match genes against HVGs in the closest training species, using the original embeddings
+    # NOTE: we need the anndata to match the indices because the embedding loading function
+    # returns a tensor, not a dictionary
+    # TODO: we could load only the genes we want, that'd be easier
+    embedding_path_closest = pd.read_csv(args.training_csv_path, index_col="species").at[species_closest, "embedding_path"]
+    gene_embedding_dict_guide = load_gene_embeddings(
+        species=species_closest,
+        genes=hvgs_guide_plain,
         embedding_model=args.embedding_model,
         embedding_path=embedding_path_closest,
     )
-    # Match genes against HVGs in the closest training species, using the original embeddings
-    genes_closest_nospecies = [x[len(species_closest) + 1:] for x in genes_closest]
-    idx_hvg_closest = pd.Series(np.arange(adata_closest.n_vars), index=adata_closest.var_names).loc[genes_closest_nospecies].values
-    gene_embeddings_closest_hvg = species_gene_embeddings_closest[species_closest][idx_hvg_closest]
+    gene_embeddings_closest_hvg = torch.tensor([gene_embedding_dict_guide[gn] for gn in hvgs_guide_plain])
 
     # Get the matix matching genes to the guide species genes. "one-hot" means winner takes all (two 1st prizes for equal distance)
     # This is the only one of the three currently used metrics that becomes exact in the limit of inferring a species that is
     # already in the database. Otherwise one could write new scoring systems that diverge for d -> 0+, so that upon Normalisation
     # (next line of code) only the closest match wins.
     # NOTE: For exact species matches, this is a sparse matrix (1-1 matching of genes). For nonexact matches, it will be dense.
-    species_genes_scores_closest = score_genes_against_centroids(
+    matrix_match_gene_guides = score_genes_against_centroids(
         species_to_gene_embeddings[args.species],
         gene_embeddings_closest_hvg,
         all_gene_names,
         return_dict=False,
         score_function="one_hot",
     )
-
     # Normalise the scores to one, to maintain overall gene expression onto the new species
-    # NOTE: this is all happening in HVG space btw
-    species_genes_scores_closest_norm = (species_genes_scores_closest.T / species_genes_scores_closest.sum(axis=1)).T
-
-    # Distribute gene counts onto genes of the closest species
-    X_projected = species_to_adata[args.species].X @ species_genes_scores_closest_norm
-    adata_projected = AnnData(
-        X=X_projected,
-        var=pd.DataFrame(index=genes_closest),
-        obs=species_to_adata[args.species].obs.copy(),
-    )
-
-    species_to_adata_inference = {
-        species_closest: adata_projected,
-    }
-
-    # Make the inference loader
-    if use_batch_labels: # we have a batch column to use for the pretrainer
-        dataset = ExperimentDatasetMultiEqual(
-            all_data = species_to_adata_inference,
-            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_inference.items()},
-            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_inference.items()},
-            all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata_inference.items()}
-        )
+    matrix_match_gene_guides_norm = (matrix_match_gene_guides.T / matrix_match_gene_guides.sum(axis=1)).T
+    
+    if use_batch_labels:
+        sorted_batch_labels_names=list(unique_batch_types)
     else:
-        dataset = ExperimentDatasetMultiEqual(
-            all_data = species_to_adata_inference,
-            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_inference.items()},
-            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_inference.items()},
-            all_batch_labs = {}
-        )
+        sorted_batch_labels_names = None
 
-    hooks = logging_presets.get_hook_container(record_keeper)
-
-    device = torch.device(args.device)
-    dt = str(datetime.now())[5:19].replace(' ', '_').replace(':', '-')
-    
-    args.dir_ = args.work_dir.rstrip('/') + '/' + args.log_dir + \
-                'test'+str(args.model_dim)+\
-                '_data_'
-    
+    print("***STARTING TRANSFER LEARNING***")
+    # Set a few infra things
     df_names = []
     for species in sorted_species_names:
         p = species_to_path[species]
@@ -581,100 +483,39 @@ def inferrer(args):
                 ('_'+dt if args.time_stamp else '') +\
                 ('_'+args.tissue_subset if args.tissue_subset else '') +\
                 ('_seed_'+str(args.seed))
-
-    
-    if use_batch_labels:
-        sorted_batch_labels_names=list(unique_batch_types)
-    else:
-        sorted_batch_labels_names = None
-    
-    #### Inference through the pretrainin model: gene expression + embeddings -> macrogenes ####
-    pretrain_state_dict = torch.load(args.pretrain_model_path)
-
-    # FIXME: this does not take into account the VAE variant of SATURN. Ok for now, in that case it should fail egregiously
-    # The number of classes in the pretrain model is the number of macrogenes/centroids
-    # notice that the input is shape[1], not shape[0], this is some quirk of torch
-    assert pretrain_state_dict['encoder.0.0.weight'].shape[1] == centroids_coords.shape[0]
-    # The output of the first linear layer within the first encoder is the hidden dimension
-    hidden_dim = pretrain_state_dict['encoder.0.0.weight'].shape[0]
-    # That is also the input to the second encoder block
-    assert pretrain_state_dict['encoder.1.0.weight'].shape[1] == hidden_dim
-    # The output of the linear layer within the second encoder block is the embedding dimension
-    # This is complicated by the fact that the defaults for both are both 256.
-    model_dim = pretrain_state_dict['encoder.1.0.weight'].shape[0]
-
-    pretrain_model = SATURNPretrainModel(
-        gene_scores=centroid_weights_trained, 
-        hidden_dim=hidden_dim,
-        embed_dim=model_dim, 
-        dropout=0.1,
-        species_to_gene_idx=species_to_gene_idx_hv_trained, 
-        vae=False,
-        sorted_batch_labels_names=sorted_batch_labels_names, 
-    ).to(device)
-    
-    pretrain_model.load_state_dict(pretrain_state_dict)
-    print("Loaded Pretrain Model")
-
-    # create the pretrain adata
-    print("Infer embedding using pretrained model")
-    if use_batch_labels:
-        # Run inference (dataset is the new gene expression data, projected with nonnegative weights onto the closest species)
-        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings(
-            dataset, pretrain_model, device, use_batch_labels,
-        )
-    
-        # Build an AnnData for exporting, in embedding space
-        adata = create_output_anndata(
-            train_emb, train_lab, train_species, 
-            train_macrogenes.cpu().numpy(), train_ref, 
-            celltype_id_map, reftype_id_map, use_batch_labels,
-            batchtype_id_map, train_batch, obs_names=all_obs_names,
-        )  
-    else:
-        # Run inference (dataset is the new gene expression data, projected with nonnegative weights onto the closest species)
-        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings(
-            dataset, pretrain_model, device, use_batch_labels, obs_names=all_obs_names,
-        )
-    
-        # Build an AnnData for exporting, in embedding space
-        adata = create_output_anndata(
-            train_emb, train_lab, train_species, 
-            train_macrogenes.cpu().numpy(), train_ref, 
-            celltype_id_map, reftype_id_map, obs_names=all_obs_names,
-        )        
-    adata.obs['species'] = args.species
-
-    print("Store AnnData in embedding space inferred through pretrained model")
     metric_dir = Path(args.work_dir)
     metric_dir.mkdir(parents=True, exist_ok=True)
     run_name = args.dir_.split(args.log_dir)[-1]
 
-    pretrain_adata_fn = f'{run_name}_inference_from_pretrain.h5ad'
-    pretrain_adata_path = metric_dir / pretrain_adata_fn
-    adata.write(pretrain_adata_path)
-
-    print("***END OF PRETRAINING INFERENCE***")
-    print("-----------------------------")
-    
-    print("***STARTING TRANSFER LEARNING***")
-    # NOTE: train_macrogenes is the input of the pretraining encoder, i.e. the gene expression passed through
-    # a single custom encoder block (p_weights -> cl_layer_norm -> relu -> dropout) -- NOT a single layer.
-    # The entire point of pretrain_model.forward returning it is such that we can use it as input in the
-    # follow-up metric model, which can now accept macrogene space info without worrying too much.
-
     if args.unfreeze_macrogenes:
         print("***MACROGENE WEIGHTS UNFROZEN***")
+        raise NotImplementedError("Unfreezing macrogenes is not implemented yet")
 
-    # NOTE: here we try to first infer from the metric model starting from:
-    # - train_macrogenes
-    # - the name (and CSR-like indices) of the guide species
-    # Output of the inference, as per the model class forward method, is the encoded gene expression
-    # in embedding space.
-    # TODO: we are not doing any fine-tuning for the time being, but we might in the future using
-    # triplet loss.
-
-    xfer_dataset = dataset
+    # Load the xfer_model parameters from:
+    # 1. the manual gene -> guide gene approach above (guide_weights, guide_layer_norm)
+    # 2. the trained pretrain model (p_weights, cl_layer_norm)
+    # 3. the trained metric model (encoder)
+    xfer_state_dict = {}
+     # Copy the gene -> guide gene weights from above. This needs not be diagonal even for identical
+    # species due to ordering of genes (the projection is onto HVG space of the target species, because
+    # those are the only genes with a macrogene weight)..
+    xfer_state_dict['guide_weights'] = torch.tensor(matrix_match_gene_guides_norm.T)
+    # leave an open multiplier for the guide gene space, decide later whether to freeze it or not
+    xfer_state_dict['guide_layer_norm.weight'] = torch.ones(matrix_match_gene_guides_norm.shape[1])
+    xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(matrix_match_gene_guides_norm.shape[1])   # The latter could be further trained later on with an appropriate triplet loss.
+    # Copy the guide gene -> macrogene weights and normalistion bias for all species
+    pretrain_state_dict = torch.load(args.pretrain_model_path)
+    xfer_state_dict['p_weights'] = deepcopy(pretrain_state_dict['p_weights'])
+    xfer_state_dict['cl_layer_norm.weight'] = deepcopy(pretrain_state_dict['cl_layer_norm.weight'])
+    xfer_state_dict['cl_layer_norm.bias'] = deepcopy(pretrain_state_dict['cl_layer_norm.bias'])
+    # Copy the encoder parameters from either the pretrain or the metric model
+    if args.encoder == 'pretrain':
+        encoder_state_dict = pretrain_state_dict
+    else:
+        encoder_state_dict = torch.load(args.metric_model_path)
+    for key, val in encoder_state_dict.items():
+        if key.startswith('encoder'):
+            xfer_state_dict[key] = deepcopy(val)
 
     xfer_model = TransferModel(
         input_dim=species_to_adata[args.species].n_vars,
@@ -686,23 +527,50 @@ def inferrer(args):
         species_to_gene_idx=species_to_gene_idx_hv_trained,
         vae=args.vae,
     )
-
-    # Load the model parameters from:
-    # 1. the trained metric model (encoder)
-    # 2. the trained pretrain model (p_weights, cl_layer_norm)
-    # 3. the manual gene -> guide gene approach above (guide_weights, guide_layer_norm)
-    # The latter could be further trained later on with an appropriate triplet loss.
-    xfer_state_dict = torch.load(args.metric_model_path)
-    # Copy the guide gene -> macrogene weights for all species
-    xfer_state_dict['p_weights'] = deepcopy(pretrain_state_dict['p_weights'])
-    # Copy the gene -> guide gene weights from above
-    xfer_state_dict['guide_weights'] = torch.tensor(species_genes_scores_closest_norm.T)
-    # set normalisation for guide gene layer: no bias, everytihng must sum to one
-    # FIXME: ...is this even making any sense? It's the weights that shuould be normalised, not the output
-    xfer_state_dict['guide_layer_norm.weight'] = torch.ones(species_genes_scores_closest_norm.shape[1])
-    xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(species_genes_scores_closest_norm.shape[1])
-
     xfer_model.load_state_dict(xfer_state_dict)
+
+    print("***ZERO-SHOT INFERENCE***")
+    if use_batch_labels: # we have a batch column to use for the pretrainer
+        xfer_dataset = ExperimentDatasetMultiEqual(
+            all_data = species_to_adata,
+            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata.items()},
+            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata.items()},
+            all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata.items()}
+        )
+        zeroshot_emb, zeroshot_lab, zeroshot_species, zeroshot_macrogenes, zeroshot_ref, zeroshot_batch = get_all_embeddings(
+            xfer_dataset, xfer_model, device, use_batch_labels,
+        )
+        adata_zeroshot = create_output_anndata(
+            zeroshot_emb, zeroshot_lab, zeroshot_species,
+            zeroshot_macrogenes.cpu().numpy(), zeroshot_ref,
+            celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, zeroshot_batch, obs_names=all_obs_names,
+        )
+    else:
+        xfer_dataset = ExperimentDatasetMultiEqual(
+            all_data = species_to_adata,
+            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata.items()},
+            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata.items()},
+            all_batch_labs = {}
+        )
+        zeroshot_emb, zeroshot_lab, zeroshot_species, zeroshot_macrogenes, zeroshot_ref = get_all_embeddings(
+            xfer_dataset, xfer_model, device, use_batch_labels,
+        )
+        adata_zeroshot = create_output_anndata(
+            zeroshot_emb, zeroshot_lab, zeroshot_species,
+            zeroshot_macrogenes.cpu().numpy(), zeroshot_ref,
+            celltype_id_map, reftype_id_map, obs_names=all_obs_names,
+        )
+    # FIXME: do we still need this one?
+    adata_zeroshot.obs['species'] = args.species
+
+    if len(run_name) > 50:
+        zeroshot_adata_fn = 'inference_zeroshot.h5ad'
+    else:
+        zeroshot_adata_fn = f'{run_name}_inference_zeroshot.h5ad'
+    zeroshot_adata_path = metric_dir / zeroshot_adata_fn
+    adata_zeroshot.write(zeroshot_adata_path)
+
+    print(f"Zero-shot AnnData Path: {zeroshot_adata_path}")
 
      # Write outputs to file
     if (not args.train) and (args.xfer_model_path is not None):
@@ -713,7 +581,7 @@ def inferrer(args):
     xfer_model.to(device)
 
     # If requested, train the xfer model
-    # NOTE: Only the first layer, which projects onto the closest species, is trained here.
+    # NOTE: Only the first encoder, which projects onto the closest species, is trained here.
     if args.train:
 
         # NOTE: The key thing is that to make the triplet loss meaningful, at least unidirectionally,
@@ -733,17 +601,6 @@ def inferrer(args):
         adata_guide.obs['species_type_label'] = adata_guide.obs['labels']
         adata_guide.obs[args.ref_label_col] = adata_guide.obs['ref_labels']
 
-        # TODO: check that the zero-shot is perfect on a known species
-        if False:
-            X_for_zero_shot = species_to_adata[args.species].X
-            train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(
-                xfer_dataset, xfer_model, device, use_batch_labels,
-            )
-            adata_zero_shot = create_output_anndata(
-                train_emb, train_lab, train_species,
-                train_macrogenes.cpu().numpy(), train_ref,
-                celltype_id_map, reftype_id_map, obs_names=all_obs_names,
-            )
         # Build dataset for data loader.
         # NOTE: the new data is in HVG space, the guide one in metric embedding space, but that's taken care of
         # in the train function: only the new data is passed through the model.
@@ -790,7 +647,6 @@ def inferrer(args):
                 all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
                 all_batch_labs = {}
             )
-
         # Load data with shuffling
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
@@ -803,6 +659,7 @@ def inferrer(args):
         for parameter in xfer_model.parameters():
             parameter.requires_grad = False
         xfer_model.guide_weights.requires_grad = True
+        # TODO: decide whether to free this layer
         xfer_model.guide_layer_norm.requires_grad = True
         # Create the optimizer
         optimizer = optim.Adam(xfer_model.parameters(), lr=args.metric_lr)
@@ -824,9 +681,8 @@ def inferrer(args):
             miner_type="cross_species",
         )
 
-        print("***STARTING TRANSFER LEARNING TRAINING***")
+        print("***STARTING FINE-TUNING***")
         all_indices_counts = pd.DataFrame(columns=["Epoch", "Triplet", "Count"])
-        scores_df = pd.DataFrame(columns=["epoch", "score", "type"] + list(sorted_species_names_xfer))
         for epoch in range(1, args.epochs+1):
             epoch_indices_counts = {}
             train(
@@ -855,8 +711,9 @@ def inferrer(args):
             print(f"Saving trained Transfer Model to {args.xfer_model_path}")
             torch.save(xfer_model.state_dict(), args.xfer_model_path)
 
+    print("***FINE-TUNED INFERENCE***")
     if use_batch_labels:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings_metric(
+        train_emb, train_lab, train_species, train_macrogenes, train_ref, train_batch = get_all_embeddings(
             xfer_dataset, xfer_model, device, use_batch_labels,
         )
         adata = create_output_anndata(
@@ -865,7 +722,7 @@ def inferrer(args):
             celltype_id_map, reftype_id_map, use_batch_labels, batchtype_id_map, train_batch, obs_names=all_obs_names,
         )
     else:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings_metric(
+        train_emb, train_lab, train_species, train_macrogenes, train_ref = get_all_embeddings(
             xfer_dataset, xfer_model, device, use_batch_labels,
         )
         adata = create_output_anndata(
@@ -875,14 +732,12 @@ def inferrer(args):
         )
 
     if len(run_name) > 50:
-        final_adata_fn = "final_adata.h5ad"
+        final_adata_fn = "finetuned_adata.h5ad"
     else:
-        final_adata_fn = f'{run_name}.h5ad'
-
+        final_adata_fn = f'{run_name}_finetuned.h5ad'
     final_path = metric_dir / final_adata_fn
     adata.write(final_path)
-    
-    print(f"Final AnnData Path: {final_path}")
+    print(f"Fine-tuned AnnData Path: {final_path}")
 
 
 if __name__ == '__main__':
@@ -934,19 +789,11 @@ if __name__ == '__main__':
     parser.add_argument('--centroid_score_func', type=str, choices=['default', 'one_hot', 'smoothed'],
                     help='Gene embedding model whose embeddings should be loaded if using gene_embedding_method')
     
-    
     # Model Setup
     parser.add_argument('--hidden_dim', type=int,
                         help='Model first layer hidden dimension')
     parser.add_argument('--model_dim', type=int,
                         help='Model latent space dimension')
-    
-    
-    # Expression Modifications
-    parser.add_argument('--binarize_expression', type=bool, nargs='?', const=True,
-                        help='Whether to binarize the gene expression matrix')
-    parser.add_argument('--scale_expression', type=bool, nargs='?', const=True,
-                        help='Whether to scale the gene expression to zero mean and unit variance')
     
     # Metric Learning Arguments
     parser.add_argument('--use_ref_labels', type=bool, nargs='?', const=True, 
@@ -955,6 +802,8 @@ if __name__ == '__main__':
                         help='batch size')
     parser.add_argument('--equalize_triplets_species', type=bool, nargs='?', const=True,
                         help='Balance species\' weighting in the metric learning model')
+    parser.add_argument('--encoder', type=str, choices=['pretrain', 'metric'],
+                        help='Which encoder to use for the transfer model. Default is to use the final metric model.')
     parser.add_argument('--train', action='store_true',
                         help="Train the transfer model instead of zero-shot inference.")
     parser.add_argument('--trained_adata_path', type=str,
@@ -963,8 +812,6 @@ if __name__ == '__main__':
     # Model paths
     parser.add_argument('--pretrain_model_path', type=str, required=True,
                         help='Path to load a pretraining model from')
-    parser.add_argument('--pretrain_batch_size', type=int,
-                        help='pretrain batch size')
     parser.add_argument('--metric_model_path', type=str, required=True,
                         help='Path to load a metric (macrogene -> embedding) model from')
     parser.add_argument('--xfer_model_path', type=str,
@@ -981,7 +828,6 @@ if __name__ == '__main__':
         non_species_batch_col=None,
         device= torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         device_num=0,
-        pretrain_batch_size=4096,
         batch_size=4096,
         model_dim=256,
         hidden_dim=256,
@@ -999,9 +845,6 @@ if __name__ == '__main__':
         embedding_model='ESM1b',
         gene_embedding_method=None,
         centroids_init_path=None,
-        binarize_expression=False,
-        scale_expression=False,
-        score_adatas=False,
         seed=0,
         unfreeze_macrogenes=False,
         score_ref_labels=False,
@@ -1011,6 +854,7 @@ if __name__ == '__main__':
         hv_span=0.3,
         centroid_score_func="default",
         train=False,
+        encoder='metric',
     )
 
     args = parser.parse_args()

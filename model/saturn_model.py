@@ -318,7 +318,7 @@ class SATURNPretrainModel(torch.nn.Module):
             return {'loss': loss}
     
     def lasso_loss(self, weights):
-        # Lasso Loss used to regularize the gene to macrogene weights
+        # Lasso Loss used to regularize (sparsify) the gene to macrogene weights
         loss = torch.nn.L1Loss(reduction="sum")
         return loss(weights, torch.zeros_like(weights))
     
@@ -559,9 +559,9 @@ class TransferModel(torch.nn.Module):
         # using weights from the trained metric model
         encoded = self.encoder(encoder_input)
         if self.vae:
-            return self.fc_mu(encoded)
+            return encoder_input, self.fc_mu(encoded)
         else:
-            return encoded
+            return encoder_input, encoded
 
 
 #####################################
