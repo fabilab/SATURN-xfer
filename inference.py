@@ -416,63 +416,73 @@ def inferrer(args):
     species_genes_scores = score_genes_against_centroids(
         X, centroids_coords, all_gene_names, score_function=centroid_score_func,
     )
-    
-    # Initialize macrogenes, i.e. the weights from the initial gene embeddings to the centroid space
-    # The initial (i.e. before pretraining) weights are the scores/distances of the genes from each centroid
-    centroid_weights_trained = torch.stack([torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained])
     centroid_weights = torch.stack([torch.tensor(species_genes_scores[gn]) for gn in all_gene_names])
 
-    if args.guide_species is not None:
-        species_closest = args.guide_species
-    else:
-        print("Find the closest species within the training set")
-        metric = {}
-        for species in sorted_species_names_trained:
-            centroid_weights_trained_species = torch.stack(
-                [torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained if gn.startswith(species)],
+    # If no guide species is given, project straight onto macrogenes
+    # else, project ot guide species and from there onto macrogenes
+    # NOTE: even when we project directly, if fine-tuning is requested,
+    # we will need one (or more) guide species for the triplet loss
+    project_to_guide = args.guide_species is not None
+    if (args.guide_species is not None) or args.train:
+        if (args.guide_species is not None) and (args.guide_species != 'auto'):
+            species_closest = args.guide_species
+        else:
+            print("Find the closest species within the training set")
+            centroid_weights_trained = torch.stack([torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained])
+            metric = {}
+            for species in sorted_species_names_trained:
+                centroid_weights_trained_species = torch.stack(
+                    [torch.tensor(species_genes_scores_trained[gn]) for gn in all_gene_names_trained if gn.startswith(species)],
+                )
+                cdist_species = torch.cdist(centroid_weights, centroid_weights_trained_species)
+                dis_closest = cdist_species.min(axis=1).values
+                nconserved = min(len(dis_closest), 50)
+                dis_mean = dis_closest[:nconserved].mean()
+                metric[species] = float(dis_mean)
+            metric = pd.Series(metric)
+            species_closest = metric.idxmin()
+            del metric, centroid_weights_trained_species, cdist_species, dis_closest, nconserved,  dis_mean
+
+        tmp = 'on' if project_to_guide else 'off'
+        print(f"Guide species within the training set: {species_closest}. Projection onto guide is {tmp}.")
+
+        # NOTE: this if is False if we request training but not projection to a guide species. We still needed to
+        # identify the species_closest for the triplet loss, but we don't need to compute any distances and such
+        # because we have the embedding results for the triplet species already, i.e. it will never go through
+        # the xfer_model.
+        if project_to_guide:
+            print("Connect genes of new species with genes of closest species for inference")
+            hvgs_guide_species = [gn for gn in all_gene_names_trained if gn.startswith(species_closest)]
+            # Strip the "species-" part in front of each gene name
+            hvgs_guide_plain = [x[len(species_closest) + 1:] for x in hvgs_guide_species]
+
+            # Match genes against HVGs in the closest training species, using the original embeddings
+            # NOTE: we need the anndata to match the indices because the embedding loading function
+            # returns a tensor, not a dictionary
+            # TODO: we could load only the genes we want, that'd be easier
+            embedding_path_closest = pd.read_csv(args.training_csv_path, index_col="species").at[species_closest, "embedding_path"]
+            gene_embedding_dict_guide = load_gene_embeddings_one_species(
+                species=species_closest,
+                genes=hvgs_guide_plain,
+                embedding_model=args.embedding_model,
+                embedding_path=embedding_path_closest,
             )
-            cdist_species = torch.cdist(centroid_weights, centroid_weights_trained_species)
-            dis_closest = cdist_species.min(axis=1).values
-            nconserved = min(len(dis_closest), 50)
-            dis_mean = dis_closest[:nconserved].mean()
-            metric[species] = float(dis_mean)
-        metric = pd.Series(metric)
-        species_closest = metric.idxmin()
-        del metric, centroid_weights_trained_species, cdist_species, dis_closest, nconserved,  dis_mean
-        print(f"Closest species within the training set: {species_closest}.")
+            gene_embeddings_closest_hvg = torch.stack([gene_embedding_dict_guide[gn] for gn in hvgs_guide_plain])
 
-    print("Connect genes of new species with genes of closest species for inference")
-    hvgs_guide_species = [gn for gn in all_gene_names_trained if gn.startswith(species_closest)]
-    # Strip the "species-" part in front of each gene name
-    hvgs_guide_plain = [x[len(species_closest) + 1:] for x in hvgs_guide_species]
-
-    # Match genes against HVGs in the closest training species, using the original embeddings
-    # NOTE: we need the anndata to match the indices because the embedding loading function
-    # returns a tensor, not a dictionary
-    # TODO: we could load only the genes we want, that'd be easier
-    embedding_path_closest = pd.read_csv(args.training_csv_path, index_col="species").at[species_closest, "embedding_path"]
-    gene_embedding_dict_guide = load_gene_embeddings_one_species(
-        species=species_closest,
-        genes=hvgs_guide_plain,
-        embedding_model=args.embedding_model,
-        embedding_path=embedding_path_closest,
-    )
-    gene_embeddings_closest_hvg = torch.stack([gene_embedding_dict_guide[gn] for gn in hvgs_guide_plain])
-
-    # Get the matix matching genes to the guide species genes. "one-hot" means winner takes all (two 1st prizes for equal distance)
-    # This is the only one of the three currently used metrics that becomes exact in the limit of inferring a species that is
-    # already in the database. Otherwise one could write new scoring systems that diverge for d -> 0+, so that upon Normalisation
-    # (next line of code) only the closest match wins.
-    # NOTE: For exact species matches, this is a sparse matrix (1-1 matching of genes). For nonexact matches, it will be dense.
-    matrix_match_gene_guides = score_genes_against_centroids(
-        species_to_gene_embeddings[args.species],
-        gene_embeddings_closest_hvg,
-        all_gene_names,
-        return_dict=False,
-        score_function="one_hot",
-    )
-    # Normalise the scores to one, to maintain overall gene expression onto the new species
-    matrix_match_gene_guides_norm = (matrix_match_gene_guides.T / matrix_match_gene_guides.sum(axis=1)).T
+            # Get the matix matching genes to the guide species genes. "one-hot" means winner takes all (two 1st prizes for equal distance)
+            # This is the only one of the three currently used metrics that becomes exact in the limit of inferring a species that is
+            # already in the database. Otherwise one could write new scoring systems that diverge for d -> 0+, so that upon Normalisation
+            # (next line of code) only the closest match wins.
+            # NOTE: For exact species matches, this is a sparse matrix (1-1 matching of genes). For nonexact matches, it will be dense.
+            matrix_match_gene_guides = score_genes_against_centroids(
+                species_to_gene_embeddings[args.species],
+                gene_embeddings_closest_hvg,
+                all_gene_names,
+                return_dict=False,
+                score_function="one_hot",
+            )
+            # Normalise the scores to one, to maintain overall gene expression onto the new species
+            matrix_match_gene_guides_norm = (matrix_match_gene_guides.T / matrix_match_gene_guides.sum(axis=1)).T
     
     if use_batch_labels:
         sorted_batch_labels_names=list(unique_batch_types)
@@ -480,6 +490,56 @@ def inferrer(args):
         sorted_batch_labels_names = None
 
     print("***STARTING TRANSFER LEARNING***")
+    # Load the xfer_model parameters. If no guide species is given, take:
+    # 1. The manual gene -> macrogene weights initialised as the centroid_weights above
+    # 2. The macrogene normalisation layer from the pretrain model
+    # 3. The encoder from either pretrained or metric model
+    # If a guide species is given, take:
+    # 1. The manual gene -> guide gene approach above (guide_weights, guide_layer_norm)
+    # 2. The guide gene -> macrogene weights from the pretrain model
+    # 3. The macrogene normalisation layer from the pretrain model
+    # 4. The encoder from either pretrained or metric model
+    pretrain_state_dict = torch.load(args.pretrain_model_path)
+    xfer_state_dict = {}
+    if not project_to_guide:
+        # NOTE: this also sends them to the device
+        xfer_state_dict['p_weights'] = centroid_weights.T.type(pretrain_state_dict['p_weights'].type())
+        #xfer_state_dict['p_weights'] = torch.tensor(centroid_weights.astype(np.float32)).to(device)
+    else:
+        # Copy the gene -> guide gene weights from above. This needs not be diagonal even for identical
+        # species due to ordering of genes (the projection is onto HVG space of the target species, because
+        # those are the only genes with a macrogene weight)..
+        xfer_state_dict['guide_weights'] = torch.tensor(matrix_match_gene_guides_norm.T.astype(np.float32)).to(device)
+        # leave an open multiplier for the guide gene space, decide later whether to freeze it or not
+        xfer_state_dict['guide_layer_norm.weight'] = torch.ones(matrix_match_gene_guides_norm.shape[1]).to(device)
+        xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(matrix_match_gene_guides_norm.shape[1]).to(device)   # The latter could be further trained later on with an appropriate triplet loss.
+        # Copy the guide gene -> macrogene weights and normalistion bias for all species
+        xfer_state_dict['p_weights'] = deepcopy(pretrain_state_dict['p_weights'])
+    xfer_state_dict['cl_layer_norm.weight'] = deepcopy(pretrain_state_dict['cl_layer_norm.weight'])
+    xfer_state_dict['cl_layer_norm.bias'] = deepcopy(pretrain_state_dict['cl_layer_norm.bias'])
+    # Copy the encoder parameters from either the pretrain or the metric model
+    if args.encoder == 'pretrain':
+        encoder_state_dict = pretrain_state_dict
+    else:
+        encoder_state_dict = torch.load(args.metric_model_path)
+    for key, val in encoder_state_dict.items():
+        if key.startswith('encoder'):
+            xfer_state_dict[key] = deepcopy(val)
+
+    xfer_model = TransferModel(
+        input_dim=species_to_adata[args.species].n_vars,
+        num_macrogenes=xfer_state_dict['cl_layer_norm.bias'].shape[0],
+        hidden_dim=xfer_state_dict['encoder.0.0.bias'].shape[0],
+        embed_dim=xfer_state_dict['encoder.1.1.bias'].shape[0],
+        guide_species=args.guide_species,
+        species_to_gene_idx=species_to_gene_idx_hv_trained if args.guide_species is not None else {},
+        vae=args.vae,
+        dropout=0.1,
+    )
+    # NOTE: both parameters from the dict and model need to be cast onto the GPU separately
+    xfer_model.load_state_dict(xfer_state_dict)
+    xfer_model.to(device)
+
     # Set a few infra things
     args.dir_ = args.work_dir + args.log_dir + \
                 'test'+str(args.model_dim)+\
@@ -496,50 +556,6 @@ def inferrer(args):
     metric_dir = Path(args.work_dir)
     metric_dir.mkdir(parents=True, exist_ok=True)
     run_name = args.dir_.split(args.log_dir)[-1]
-
-    if args.unfreeze_macrogenes:
-        print("***MACROGENE WEIGHTS UNFROZEN***")
-        raise NotImplementedError("Unfreezing macrogenes is not implemented yet")
-
-    # Load the xfer_model parameters from:
-    # 1. the manual gene -> guide gene approach above (guide_weights, guide_layer_norm)
-    # 2. the trained pretrain model (p_weights, cl_layer_norm)
-    # 3. the trained metric model (encoder)
-    xfer_state_dict = {}
-     # Copy the gene -> guide gene weights from above. This needs not be diagonal even for identical
-    # species due to ordering of genes (the projection is onto HVG space of the target species, because
-    # those are the only genes with a macrogene weight)..
-    xfer_state_dict['guide_weights'] = torch.tensor(matrix_match_gene_guides_norm.T.astype(np.float32)).to(device)
-    # leave an open multiplier for the guide gene space, decide later whether to freeze it or not
-    xfer_state_dict['guide_layer_norm.weight'] = torch.ones(matrix_match_gene_guides_norm.shape[1]).to(device)
-    xfer_state_dict['guide_layer_norm.bias'] = torch.zeros(matrix_match_gene_guides_norm.shape[1]).to(device)   # The latter could be further trained later on with an appropriate triplet loss.
-    # Copy the guide gene -> macrogene weights and normalistion bias for all species
-    pretrain_state_dict = torch.load(args.pretrain_model_path)
-    xfer_state_dict['p_weights'] = deepcopy(pretrain_state_dict['p_weights'])
-    xfer_state_dict['cl_layer_norm.weight'] = deepcopy(pretrain_state_dict['cl_layer_norm.weight'])
-    xfer_state_dict['cl_layer_norm.bias'] = deepcopy(pretrain_state_dict['cl_layer_norm.bias'])
-    # Copy the encoder parameters from either the pretrain or the metric model
-    if args.encoder == 'pretrain':
-        encoder_state_dict = pretrain_state_dict
-    else:
-        encoder_state_dict = torch.load(args.metric_model_path)
-    for key, val in encoder_state_dict.items():
-        if key.startswith('encoder'):
-            xfer_state_dict[key] = deepcopy(val)
-
-    xfer_model = TransferModel(
-        input_dim=species_to_adata[args.species].n_vars,
-        num_macrogenes=xfer_state_dict['p_weights'].shape[0],
-        dropout=0.1,
-        hidden_dim=xfer_state_dict['encoder.0.0.bias'].shape[0],
-        embed_dim=xfer_state_dict['encoder.1.1.bias'].shape[0],
-        guide_species=species_closest,
-        species_to_gene_idx=species_to_gene_idx_hv_trained,
-        vae=args.vae,
-    )
-    # NOTE: both parameters from the dict and model need to be cast onto the GPU separately
-    xfer_model.load_state_dict(xfer_state_dict)
-    xfer_model.to(device)
 
     print("***ZERO-SHOT INFERENCE***")
     if use_batch_labels: # we have a batch column to use for the pretrainer
@@ -572,7 +588,6 @@ def inferrer(args):
             zeroshot_macrogenes.cpu().numpy(), zeroshot_ref,
             celltype_id_map, reftype_id_map, obs_names=all_obs_names,
         )
-    # FIXME: do we still need this one?
     adata_zeroshot.obs['species'] = args.species
 
     if len(run_name) > 50:
@@ -590,136 +605,140 @@ def inferrer(args):
         print(f"Saving Transfer Model to {args.xfer_model_path}")
         torch.save(xfer_model.state_dict(), args.xfer_model_path)
 
-    # If requested, train the xfer model
-    # NOTE: Only the first encoder, which projects onto the closest species, is trained here.
-    if args.train:
+    # If no training is requested, we can stop here
+    if not args.train:
+        return
 
-        # NOTE: The key thing is that to make the triplet loss meaningful, at least unidirectionally,
-        # we must run the metric (xfer) training with at least two species (the guide species is the
-        # obvious candidate AND also shuffle to ensure both species are found in EACH batch. For now
-        # we just use autobatching as the rest of SATURN but we'll have to fix both anyway
-        if args.trained_adata_path is None:
-            raise ValueError("Must provide a trained adata path for training the transfer model.")
+    # NOTE: The key thing is that to make the triplet loss meaningful, at least unidirectionally,
+    # we must run the metric (xfer) training with at least two species (the guide species is the
+    # obvious candidate AND also shuffle to ensure both species are found in EACH batch. For now
+    # we just use autobatching as the rest of SATURN but we'll have to fix both anyway
+    if args.trained_adata_path is None:
+        raise ValueError("Must provide a trained adata path for training the transfer model.")
 
-        adata_trained = sc.read(args.trained_adata_path)
-        # NOTE: this is a sanity check to ensure that the guide species is in the training set
-        if species_closest not in adata_trained.obs['species'].unique():
-            raise ValueError(f"Guide species {species_closest} not found in training set.")
+    adata_trained = sc.read(args.trained_adata_path)
+    # NOTE: this is a sanity check to ensure that the guide species is in the training set
+    if species_closest not in adata_trained.obs['species'].unique():
+        raise ValueError(f"Guide species {species_closest} not found in training set.")
 
-        # Restrict the adata to the guide species
-        adata_guide = adata_trained[adata_trained.obs['species'] == species_closest]
-        adata_guide.obs['species_type_label'] = adata_guide.obs['labels']
-        adata_guide.obs[args.ref_label_col] = adata_guide.obs['ref_labels']
+    # Restrict the adata to the guide species
+    adata_guide = adata_trained[adata_trained.obs['species'] == species_closest]
+    adata_guide.obs['species_type_label'] = adata_guide.obs['labels']
+    adata_guide.obs[args.ref_label_col] = adata_guide.obs['ref_labels']
 
-        # Build dataset for data loader.
-        # NOTE: the new data is in HVG space, the guide one in metric embedding space, but that's taken care of
-        # in the train function: only the new data is passed through the model.
-        species_to_adata_xfer = {
-            args.species: species_to_adata[args.species],
-            species_closest: adata_guide,
-        }
-        sorted_species_names_xfer = sorted(species_to_adata_xfer.keys())
+    # Build dataset for data loader.
+    # NOTE: the new data is in HVG space, the guide one in metric embedding space, but that's taken care of
+    # in the train function: only the new data is passed through the model.
+    species_to_adata_xfer = {
+        args.species: species_to_adata[args.species],
+        species_closest: adata_guide,
+    }
+    sorted_species_names_xfer = sorted(species_to_adata_xfer.keys())
 
-        # Create the "truth_labels" column which is an integer representation of all cell types
-        unique_cell_types_xfer = set()
-        for adata in species_to_adata_xfer.values():
-            unique_cell_types_xfer = (unique_cell_types_xfer | set(adata.obs["species_type_label"]))
-        unique_cell_types_xfer = sorted(unique_cell_types_xfer)
-        celltype_id_map_xfer = {cell_type: index for index, cell_type in enumerate(unique_cell_types_xfer)}
-        for adata in species_to_adata_xfer.values():
-            adata.obs["truth_labels"] = pd.Categorical(
-                values=[celltype_id_map_xfer[cell_type] for cell_type in adata.obs["species_type_label"]]
-            )
-
-        # Create the "ref_labels" column which is also an integer representation of all cell types
-        unique_ref_types_xfer = set()
-        for adata in species_to_adata_xfer.values():
-            unique_ref_types_xfer = (unique_ref_types_xfer | set(adata.obs[args.ref_label_col]))
-        unique_ref_types_xfer = sorted(unique_ref_types_xfer)
-        reftype_id_map_xfer = {ref_type: index for index, ref_type in enumerate(unique_ref_types_xfer)}
-        for adata in species_to_adata_xfer.values():
-            adata.obs["ref_labels"] = pd.Categorical(
-                values=[reftype_id_map_xfer[ref_type] for ref_type in adata.obs[args.ref_label_col]]
-            )
-
-        # Make the guide species data loader
-        if use_batch_labels: # we have a batch column to use for the pretrainer
-            train_dataset = ExperimentDatasetMultiEqual(
-                all_data = species_to_adata_xfer,
-                all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_xfer.items()},
-                all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
-                all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata_xfer.items()}
-            )
-        else:
-            train_dataset = ExperimentDatasetMultiEqual(
-                all_data = species_to_adata_xfer,
-                all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_xfer.items()},
-                all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
-                all_batch_labs = {}
-            )
-        # Load data with shuffling
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            collate_fn=multi_species_collate_fn,
-            batch_size=1024,
-            shuffle=True,
+    # Create the "truth_labels" column which is an integer representation of all cell types
+    unique_cell_types_xfer = set()
+    for adata in species_to_adata_xfer.values():
+        unique_cell_types_xfer = (unique_cell_types_xfer | set(adata.obs["species_type_label"]))
+    unique_cell_types_xfer = sorted(unique_cell_types_xfer)
+    celltype_id_map_xfer = {cell_type: index for index, cell_type in enumerate(unique_cell_types_xfer)}
+    for adata in species_to_adata_xfer.values():
+        adata.obs["truth_labels"] = pd.Categorical(
+            values=[celltype_id_map_xfer[cell_type] for cell_type in adata.obs["species_type_label"]]
         )
 
-        # freeze everything except the first encoder (gene -> guide gene)
-        for parameter in xfer_model.parameters():
-            parameter.requires_grad = False
+    # Create the "ref_labels" column which is also an integer representation of all cell types
+    unique_ref_types_xfer = set()
+    for adata in species_to_adata_xfer.values():
+        unique_ref_types_xfer = (unique_ref_types_xfer | set(adata.obs[args.ref_label_col]))
+    unique_ref_types_xfer = sorted(unique_ref_types_xfer)
+    reftype_id_map_xfer = {ref_type: index for index, ref_type in enumerate(unique_ref_types_xfer)}
+    for adata in species_to_adata_xfer.values():
+        adata.obs["ref_labels"] = pd.Categorical(
+            values=[reftype_id_map_xfer[ref_type] for ref_type in adata.obs[args.ref_label_col]]
+        )
+
+    # Make the guide species data loader
+    if use_batch_labels: # we have a batch column to use for the pretrainer
+        train_dataset = ExperimentDatasetMultiEqual(
+            all_data = species_to_adata_xfer,
+            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_xfer.items()},
+            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
+            all_batch_labs = {species:adata.obs["batch_labels"] for (species, adata) in species_to_adata_xfer.items()}
+        )
+    else:
+        train_dataset = ExperimentDatasetMultiEqual(
+            all_data = species_to_adata_xfer,
+            all_ys = {species:adata.obs["truth_labels"] for (species, adata) in species_to_adata_xfer.items()},
+            all_refs = {species:adata.obs["ref_labels"] for (species, adata) in species_to_adata_xfer.items()},
+            all_batch_labs = {}
+        )
+    # Load data with shuffling
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        collate_fn=multi_species_collate_fn,
+        batch_size=1024,
+        shuffle=True,
+    )
+
+    # freeze everything except the first encoder (gene -> guide gene or gene -> macrogene,
+    # depending on whether a guide species is requested).
+    for parameter in xfer_model.parameters():
+        parameter.requires_grad = False
+    if project_to_guide:
         xfer_model.guide_weights.requires_grad = True
         # TODO: decide whether to free this layer
         xfer_model.guide_layer_norm.requires_grad = True
-        # Create the optimizer
-        optimizer = optim.Adam(xfer_model.parameters(), lr=args.metric_lr)
+    else:
+        xfer_model.p_weights.requires_grad = True
+    # Create the optimizer
+    # metric_lr is the learning rate for the metric model, which is the first encoder in the xfer model
+    optimizer = optim.Adam(xfer_model.parameters(), lr=args.metric_lr)
 
-        distance = distances.CosineSimilarity()
-        reducer = reducers.ThresholdReducer(low = 0)
+    distance = distances.CosineSimilarity()
+    reducer = reducers.ThresholdReducer(low = 0)
 
-        # TripletMarginMMDLoss
-        loss_func = losses.TripletMarginLoss(
-            margin=0.2,
-            distance=distance,
-            reducer=reducer,
+    # Loss and mining functions for triplets
+    loss_func = losses.TripletMarginLoss(
+        margin=0.2,
+        distance=distance,
+        reducer=reducer,
+    )
+    mining_func = miners.TripletMarginMiner(
+        margin=0.2,
+        distance=distance,
+        type_of_triplets="semihard",
+        miner_type="cross_species",
+    )
+
+    print("***STARTING FINE-TUNING***")
+    all_indices_counts = pd.DataFrame(columns=["Epoch", "Triplet", "Count"])
+    for epoch in range(1, args.epochs+1):
+        epoch_indices_counts = {}
+        train(
+            xfer_model,
+            loss_func,
+            mining_func,
+            device,
+            train_loader,
+            optimizer,
+            epoch,
+            args.mnn,
+            sorted_species_names_xfer,
+            species_closest,
+            use_ref_labels=args.use_ref_labels,
+            indices_counts=epoch_indices_counts,
+            equalize_triplets_species=args.equalize_triplets_species,
         )
 
-        mining_func = miners.TripletMarginMiner(
-            margin=0.2,
-            distance=distance,
-            type_of_triplets="semihard",
-            miner_type="cross_species",
-        )
+        # Collect output metrics for this one epoch
+        epoch_df = pd.DataFrame.from_records(list(epoch_indices_counts.items()), columns=["Triplet", "Count"])
+        epoch_df["Epoch"] = epoch
+        all_indices_counts = pd.concat((all_indices_counts, epoch_df))
 
-        print("***STARTING FINE-TUNING***")
-        all_indices_counts = pd.DataFrame(columns=["Epoch", "Triplet", "Count"])
-        for epoch in range(1, args.epochs+1):
-            epoch_indices_counts = {}
-            train(
-                xfer_model,
-                loss_func,
-                mining_func,
-                device,
-                train_loader,
-                optimizer,
-                epoch,
-                args.mnn,
-                sorted_species_names_xfer,
-                species_closest,
-                use_ref_labels=args.use_ref_labels,
-                indices_counts=epoch_indices_counts,
-                equalize_triplets_species=args.equalize_triplets_species,
-            )
-
-            # Collect output metrics for this one epoch
-            epoch_df = pd.DataFrame.from_records(list(epoch_indices_counts.items()), columns=["Triplet", "Count"])
-            epoch_df["Epoch"] = epoch
-            all_indices_counts = pd.concat((all_indices_counts, epoch_df))
-
-        if args.xfer_model_path is not None:
-            # Save the transfer model if asked to
-            print(f"Saving trained Transfer Model to {args.xfer_model_path}")
-            torch.save(xfer_model.state_dict(), args.xfer_model_path)
+    if args.xfer_model_path is not None:
+        # Save the transfer model if asked to
+        print(f"Saving trained Transfer Model to {args.xfer_model_path}")
+        torch.save(xfer_model.state_dict(), args.xfer_model_path)
 
     print("***FINE-TUNED INFERENCE***")
     if use_batch_labels:
@@ -856,7 +875,6 @@ if __name__ == '__main__':
         gene_embedding_method=None,
         centroids_init_path=None,
         seed=0,
-        unfreeze_macrogenes=False,
         score_ref_labels=False,
         tissue_subset=None,
         tissue_column="tissue_type",

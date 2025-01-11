@@ -484,23 +484,27 @@ class TransferModel(torch.nn.Module):
         self.input_dim = input_dim
         self.num_macrogenes = num_macrogenes
         self.guide_species = guide_species
-
         self.vae = vae
-        self.species_to_gene_idx = species_to_gene_idx
 
-        # Number of genes in the guide species
-        tmp = self.species_to_gene_idx[self.guide_species]
-        self.num_guide_genes = tmp[1] - tmp[0]
-        del tmp
+        # If no guide species is given, project straight into macrogene space
+        # Ottherwise, project onto guide species and from there onto macrogenes
+        if self.guide_species is None:
+            self.p_weights = nn.Parameter(torch.zeros(self.num_macrogenes, self.input_dim))
+        else:
+            self.species_to_gene_idx = species_to_gene_idx
+            # Number of genes in the guide species
+            tmp = self.species_to_gene_idx[self.guide_species]
+            self.num_guide_genes = tmp[1] - tmp[0]
+            del tmp
 
-        # NOTE: see note above for the meaning and rationale for this
-        self.num_genes = 0
-        for k,v in self.species_to_gene_idx.items():
-            self.num_genes = max(self.num_genes, v[1])
+            # NOTE: see note above for the meaning and rationale for this
+            self.num_genes = 0
+            for k,v in self.species_to_gene_idx.items():
+                self.num_genes = max(self.num_genes, v[1])
 
-        self.guide_weights = nn.Parameter(torch.zeros(self.input_dim, self.num_guide_genes))
-        self.guide_layer_norm = nn.LayerNorm(self.num_guide_genes)
-        self.p_weights = nn.Parameter(torch.zeros(self.num_macrogenes, self.num_genes))
+            self.guide_weights = nn.Parameter(torch.zeros(self.input_dim, self.num_guide_genes))
+            self.guide_layer_norm = nn.LayerNorm(self.num_guide_genes)
+            self.p_weights = nn.Parameter(torch.zeros(self.num_macrogenes, self.num_genes))
         self.cl_layer_norm = nn.LayerNorm(self.num_macrogenes)
 
         if self.vae:
@@ -536,17 +540,23 @@ class TransferModel(torch.nn.Module):
         # are positive, and we are just splashing gene expression - which is
         # nonnegative - onto another basis that is also nonnegative.
         expr = torch.log1p(inp)
-        x = nn.functional.linear(expr, self.guide_weights.exp())
-        x = self.guide_layer_norm(x)
-        x = F.relu(x) # all pos
-        x = F.dropout(x, self.dropout)
 
-        # NOTE: This chunk comes straight from the pretrain model
-        batch_size = inp.shape[0]
-        expr = torch.zeros(batch_size, self.num_genes).to(inp.device)
-        filler_idx = self.species_to_gene_idx[self.guide_species]
-        expr[:, filler_idx[0]:filler_idx[1]] = x
-        expr = torch.log1p(expr)
+        # If there is no guide species, project directly onto macrogene space
+        # using positive weights. If there is a guide, project onto the
+        # guide and then use (mostly pre-trained) weights to project onto
+        # macrogene space
+        if self.guide_species is not None:
+            x = nn.functional.linear(expr, self.guide_weights.exp())
+            x = self.guide_layer_norm(x)
+            x = F.relu(x) # all pos
+            x = F.dropout(x, self.dropout)
+
+            # NOTE: This chunk comes straight from the pretrain model
+            batch_size = inp.shape[0]
+            expr = torch.zeros(batch_size, self.num_genes).to(inp.device)
+            filler_idx = self.species_to_gene_idx[self.guide_species]
+            expr[:, filler_idx[0]:filler_idx[1]] = x
+            expr = torch.log1p(expr)
 
         # Finally, the custom encoder from guide species to macrogene space3
         x = nn.functional.linear(expr, self.p_weights.exp())
