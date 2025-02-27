@@ -596,10 +596,11 @@ def make_centroids(embeds, species_gene_names, num_centroids=2000, normalize=Fal
         )
         dd = torch.cdist(embeds, cluster_centers, p=2)
     elif KMeans is not None:
-        kmeans_obj = KMeans(n_clusters=num_centroids, random_state=seed).fit(embeds)
+        embeds_cpu = embeds.to("cpu")
+        kmeans_obj = KMeans(n_clusters=num_centroids, random_state=seed).fit(embeds_cpu)
         # dd is distance frome each gene to centroid
         cluster_centers = kmeans_obj.cluster_centers_
-        dd = kmeans_obj.transform(embeds)
+        dd = kmeans_obj.transform(embeds_cpu)
     else:
         raise ImportError("kmeans_pytorch or sklearn.cluster.KMeans is required for this function")
     
