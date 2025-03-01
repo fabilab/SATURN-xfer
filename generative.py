@@ -152,8 +152,8 @@ def trainer(args):
     adata_embed = sc.read(args.in_adata_path)
     print("Loaded macrogene expression data")
 
-    if args.species_guide is not None:
-        species_guide = args.species_guide
+    if args.guide_species is not None:
+        species_guide = args.guide_species
         adata_embed = adata_embed[adata_embed.obs["species"] == species_guide]
     else:
         species_guide = "all"
@@ -167,9 +167,7 @@ def trainer(args):
     # NOTE: the order of genes in the new species is arbitrary
     all_gene_names = list(embedding_dict.keys())
     # stacked embeddings
-    X = torch.stack(
-        [embedding_dict[gene_symbol.lower()] for gene_symbol in all_gene_names]
-    )
+    X = torch.stack([embedding_dict[gene_symbol] for gene_symbol in all_gene_names])
     print("Loaded protein embeddings")
 
     # NOTE: there is no such thing as HVG strictu sensu. We can do HVG after we get the first pass at generating a synthetic atlas
@@ -182,15 +180,16 @@ def trainer(args):
     print("Loaded centroids and existing scores")
 
     print("Score genes of new species against cluster centers")
-    centroids_coords = torch.tensor(centroids_coords).type("f4")
+    centroids_coords = torch.tensor(centroids_coords).type(X.dtype)
     gene_scores = score_genes_against_centroids(
         X,
         centroids_coords,
         all_gene_names,
         score_function=centroid_score_func,
     )
+    # stacked gene scores
     centroid_weights = torch.stack(
-        [torch.tensor(species_genes_scores[gn]) for gn in all_gene_names]
+        [torch.tensor(gene_scores[gn]) for gn in all_gene_names]
     )
 
     print("***STARTING GENERATIVE LEARNING***")
@@ -212,11 +211,10 @@ def trainer(args):
             gen_state_dict[key] = deepcopy(val)
 
     gen_model = GenerativeModel(
-        species=species,
-        gene_scores=gene_scores,
+        gene_scores=centroid_weights,
+        dropout=0.1,
         hidden_dim=gen_state_dict["encoder.0.0.bias"].shape[0],
         embed_dim=gen_state_dict["encoder.1.1.bias"].shape[0],
-        dropout=0.1,
     )
     gen_model.load_state_dict(gen_state_dict)
     gen_model.to(device)
@@ -415,12 +413,6 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to embeddings summary pt file for the peptides of the species to infer",
-    )
-    parser.add_argument(
-        "--training_csv_path",
-        type=str,
-        required=True,
-        help="Path to csv containing training adata and embedding paths and species names",
     )
     parser.add_argument(
         "--species", type=str, help="Data to infer belongs to this species (optional)"

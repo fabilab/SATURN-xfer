@@ -34,7 +34,11 @@ class GenerativeModel(torch.nn.Module):
         pe_sim_penalty=1.0,
     ):
         """Generate synthetic cell gene expression vectors for new species."""
-        super.__init__()
+        super().__init__()
+
+        self.dropout = dropout
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
 
         self.num_gene_scores = len(gene_scores)
         self.p_weights = nn.Parameter(gene_scores.float().t().log())
@@ -43,9 +47,6 @@ class GenerativeModel(torch.nn.Module):
 
         # num_cl is the number of macrogenes
         self.num_cl = gene_scores.shape[1]
-        self.expr_filler = nn.Parameter(
-            torch.zeros(self.num_genes), requires_grad=False
-        )  # pad exprs with zeros
 
         # Z Encoder
         self.encoder = nn.Sequential(
@@ -60,10 +61,10 @@ class GenerativeModel(torch.nn.Module):
         self.cl_scale_decoder = full_block(self.hidden_dim, self.num_cl)
 
         self.px_dropout_decoder = nn.Sequential(
-            nn.Linear(self.hidden_dim, gene_idxs[1] - gene_idxs[0])
+            nn.Linear(self.hidden_dim, self.num_gene_scores),
         )
 
-        self.px_r = torch.nn.Parameter(torch.randn(gene_idxs[1] - gene_idxs[0]))
+        self.px_r = torch.nn.Parameter(torch.randn(self.num_gene_scores))
 
         # Gene to Macrogene modifiers
         self.l1_penalty = l1_penalty
