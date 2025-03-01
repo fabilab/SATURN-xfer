@@ -213,9 +213,9 @@ def trainer(args):
 
     gen_model = GenerativeModel(
         species=species,
-        gene_scores,
-        hidden_dim=xfer_state_dict["encoder.0.0.bias"].shape[0],
-        embed_dim=xfer_state_dict["encoder.1.1.bias"].shape[0],
+        gene_scores=gene_scores,
+        hidden_dim=gen_state_dict["encoder.0.0.bias"].shape[0],
+        embed_dim=gen_state_dict["encoder.1.1.bias"].shape[0],
         dropout=0.1,
     )
     gen_model.load_state_dict(gen_state_dict)
@@ -273,7 +273,6 @@ def trainer(args):
     if not args.train:
         return
 
-
     # Make the guide species data loader
     if use_batch_labels:  # we have a batch column to use for the pretrainer
         train_dataset = ExperimentDatasetMultiEqual(
@@ -328,7 +327,12 @@ def trainer(args):
     print("***STARTING FINE-TUNING***")
     # TODO: do something about estimating HVGs in the new species
     train(
-        gen_model, train_loader, optimizer, device, args.epochs, embeddings_tensor=X,
+        gen_model,
+        train_loader,
+        optimizer,
+        device,
+        args.epochs,
+        embeddings_tensor=X,
     )
 
     if args.gen_model_path is not None:
@@ -506,7 +510,6 @@ if __name__ == "__main__":
         help="Train the transfer model instead of zero-shot inference.",
     )
     parser.add_argument("--epochs", type=int, help="How many epochs to train for")
-
 
     # Model paths
     parser.add_argument(
