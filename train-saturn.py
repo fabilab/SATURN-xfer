@@ -614,8 +614,6 @@ def trainer(args):
         for sgn in species_gene_names:
             centroid_weights.append(torch.tensor(species_genes_scores[sgn]))
     centroid_weights =  torch.stack(centroid_weights)
-
-
     
     # Make the train loader
     if use_batch_labels: # we have a batch column to use for the pretrainer
@@ -672,7 +670,6 @@ def trainer(args):
 
     model_dim = args.model_dim
     hidden_dim = args.hidden_dim    
-    
     
     if use_batch_labels:
         sorted_batch_labels_names=list(unique_batch_types)
