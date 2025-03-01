@@ -17,7 +17,7 @@ def data_to_torch_X(X):
     if isinstance(X, sc.AnnData):
         X = X.X
     if not isinstance(X, np.ndarray):
-            X = X.toarray()
+        X = X.toarray()
     return torch.from_numpy(X).float()
 
 class ExperimentDatasetMulti(data.Dataset):
