@@ -399,13 +399,10 @@ def get_species_triplet_indices( # returns indices of triplet
             unique_a_l = torch.unique(a_l)
             unique_a_p = torch.unique(p_l)
             
-            
-            
             # NEW IDEA:
             # FOR 3 SPECIES
             # BEFORE: NEGATIVE FROM ANY OTHER LABEL
             # NOW: NEGATIVE FROM ANY OTHER LABEL FROM THE ANCHOR AND POSITIVE'S SPECIES
-            
             for al in unique_a_l:
                 for pl in unique_a_p:
                     a_s = species[labels == al][0] # should just be the same species
@@ -419,8 +416,10 @@ def get_species_triplet_indices( # returns indices of triplet
                                              )[0]
                     set_idx = torch.where((a_l == al) & (p_l == pl))[0]
                     choice_size = len(set_idx)
-                    if choice_size != 0:
-                        n_rand = torch.randint(0, len(poss_n_ind), (choice_size,))
+                    # FIXME: Fabio's edit: this is failing otherwise
+                    total_size = len(poss_n_ind)
+                    if (choice_size != 0) and (total_size != 0):
+                        n_rand = torch.randint(0, total_size, (choice_size,))
                         n_[set_idx] = n_inds[poss_n_ind[n_rand]]
             
         n = n_            

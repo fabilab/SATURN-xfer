@@ -536,10 +536,11 @@ def make_centroids(
     # Fallback for GPU-based clustering
     if dd is None:
         print("Attempting kmeans on CPU (sklearn)")
-        kmeans_obj = KMeans(n_clusters=num_centroids, random_state=seed).fit(embeds)
+        embeds_cpu = embeds.to("cpu")
+        kmeans_obj = KMeans(n_clusters=num_centroids, random_state=seed).fit(embeds_cpu)
         # dd is distance frome each gene to centroid
         cluster_centers = kmeans_obj.cluster_centers_
-        dd = kmeans_obj.transform(embeds)
+        dd = kmeans_obj.transform(embeds_cpu)
         print("sklearn kmeans succeeded")
 
     if score_function == "default":
