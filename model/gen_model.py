@@ -39,14 +39,15 @@ class GenerativeModel(torch.nn.Module):
         self.dropout = dropout
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
-
         self.num_gene_scores = len(gene_scores)
-        self.p_weights = nn.Parameter(gene_scores.float().t().log())
-        if random_weights:  # for the genes to centroids weights
-            nn.init.xavier_uniform_(self.p_weights, gain=nn.init.calculate_gain("relu"))
-
         # num_cl is the number of macrogenes
         self.num_cl = gene_scores.shape[1]
+
+        # Gene -> macrogene weights
+        self.p_weights = nn.Parameter(gene_scores.float().t().log())
+        if random_weights:
+            nn.init.xavier_uniform_(self.p_weights, gain=nn.init.calculate_gain("relu"))
+        self.cl_layer_norm = nn.LayerNorm(self.num_cl)
 
         # Z Encoder
         self.encoder = nn.Sequential(
@@ -54,22 +55,24 @@ class GenerativeModel(torch.nn.Module):
             full_block(self.hidden_dim, self.embed_dim, self.dropout),
         )
 
+        # Decoders
         self.px_decoder = nn.Sequential(
             full_block(self.embed_dim, self.hidden_dim, self.dropout),
         )
-
         self.cl_scale_decoder = full_block(self.hidden_dim, self.num_cl)
-
         self.px_dropout_decoder = nn.Sequential(
             nn.Linear(self.hidden_dim, self.num_gene_scores),
         )
-
+        # Theta rate for ZINB
         self.px_r = torch.nn.Parameter(torch.randn(self.num_gene_scores))
 
-        # Gene to Macrogene modifiers
+        # Weight for the Lasso on gene -> weights
         self.l1_penalty = l1_penalty
+        # Weight for the similarity on gene -> weights, which biases connections towards similar macrogenes/genes
         self.pe_sim_penalty = pe_sim_penalty
 
+        # This is used in the similarity loss
+        # The shape is macrogenes x 256
         self.p_weights_embeddings = nn.Sequential(
             full_block(
                 self.num_cl, 256, self.dropout
@@ -118,9 +121,7 @@ class GenerativeModel(torch.nn.Module):
         cl_scale = self.cl_scale_decoder(decoded)
 
         # Decode macrogenes to genes of this one NEW species
-        cl_to_px = nn.functional.linear(
-            cl_scale.unsqueeze(0), self.p_weights.exp().t()
-        )[:, :, idx[0] : idx[1]]
+        cl_to_px = nn.functional.linear(cl_scale.unsqueeze(0), self.p_weights.exp().t())
 
         # Distribute the means by cluster, based on the current weights of gene_to_macrogene
         px_scale_decode = nn.Softmax(-1)(cl_to_px.squeeze())
@@ -180,14 +181,21 @@ class GenerativeModel(torch.nn.Module):
 
     def gene_weight_ranking_loss(self, weights, embeddings):
         """Ranking loss used to regularize the gene to macrogene weights"""
-        # weights is M x G
+        # weights is M x G, the gene -> macrogene weights
+        # p_weights_embeddings is M x 256, macrogenes to a standardised latent space
+        # x1 is G x 256, genes to a standardised latent space
+        # This way we can compute similarity between gene/protein embeddings in a latent space
         x1 = self.p_weights_embeddings(weights.t())
-        # genes x 256
+
+        # Mean squared error loss
         loss = nn.MSELoss(reduction="sum")
         similarity = torch.nn.CosineSimilarity()
 
+        # Resample randon G x 256 weights (i.e. randomise genes)
         idx1 = torch.randint(low=0, high=x1.shape[0], size=(x1.shape[0],))
         x2 = x1[idx1, :]
+
+        # Compute self-similarity of these weights after randomisation
         target = similarity(embeddings, embeddings[idx1, :])
 
         return loss(similarity(x1, x2), target)

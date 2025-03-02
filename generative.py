@@ -140,6 +140,44 @@ def train(
         return model
 
 
+def create_output_anndata(
+    train_counts,
+    train_lab,
+    train_species,
+    species_guide,
+    train_macrogenes,
+    train_embed,
+    train_ref,
+    use_batch_labels=False,
+    train_batch=None,
+    obs_names=None,
+):
+    """
+    Create an AnnData from the generative results
+    """
+    adata = AnnData(train_counts)
+    labels = train_lab
+    adata.obs["labels"] = pd.Categorical(labels)
+    adata.obs["labels2"] = pd.Categorical(
+        [l.split("_")[-1] for l in adata.obs["labels"]]
+    )
+
+    ref_labels = train_ref
+    adata.obs["ref_labels"] = pd.Categorical(ref_labels)
+
+    adata.obs["species"] = train_species
+    adata.uns["guide_species"] = species_guide
+
+    adata.obsm["macrogenes"] = train_macrogenes
+    adata.obsm["embed"] = train_embed
+    if use_batch_labels:
+        batch_labels = train_batch
+        adata.obs["batch_labels"] = pd.Categorical(batch_labels)
+    if obs_names is not None:
+        adata.obs_names = obs_names
+    return adata
+
+
 def trainer(args):
     """
     Runs the generative pipeline
@@ -194,29 +232,34 @@ def trainer(args):
 
     print("***STARTING GENERATIVE LEARNING***")
     pretrain_state_dict = torch.load(args.pretrain_model_path)
-    gen_state_dict = {}
+    # Copy the encoder parameters from either the pretrain or the metric model
+    if args.encoder == "pretrain":
+        encoder_state_dict = pretrain_state_dict
+    else:
+        encoder_state_dict = torch.load(args.metric_model_path)
+
+    gen_model = GenerativeModel(
+        gene_scores=centroid_weights,
+        dropout=0.1,
+        hidden_dim=encoder_state_dict["encoder.0.0.bias"].shape[0],
+        embed_dim=encoder_state_dict["encoder.1.1.bias"].shape[0],
+    )
+    # Set frozen layers from the pretrained models
+    gen_state_dict = gen_model.state_dict()
     gen_state_dict["cl_layer_norm.weight"] = deepcopy(
         pretrain_state_dict["cl_layer_norm.weight"]
     )
     gen_state_dict["cl_layer_norm.bias"] = deepcopy(
         pretrain_state_dict["cl_layer_norm.bias"]
     )
-    # Copy the encoder parameters from either the pretrain or the metric model
-    if args.encoder == "pretrain":
-        encoder_state_dict = pretrain_state_dict
-    else:
-        encoder_state_dict = torch.load(args.metric_model_path)
     for key, val in encoder_state_dict.items():
         if key.startswith("encoder"):
             gen_state_dict[key] = deepcopy(val)
 
-    gen_model = GenerativeModel(
-        gene_scores=centroid_weights,
-        dropout=0.1,
-        hidden_dim=gen_state_dict["encoder.0.0.bias"].shape[0],
-        embed_dim=gen_state_dict["encoder.1.1.bias"].shape[0],
-    )
+    # Reload state dict with pretrained initialisations
     gen_model.load_state_dict(gen_state_dict)
+
+    # Ship to GPU
     gen_model.to(device)
 
     # Set a few infra things
@@ -238,13 +281,14 @@ def trainer(args):
     run_name = args.dir_.split(args.log_dir)[-1]
 
     print("***ZERO-SHOT GENERATION***")
-    zeroshot_macrogenes = adata_embed.obsm["macrogenes"]
+    zeroshot_macrogenes = torch.tensor(adata_embed.obsm["macrogenes"])
+    zeroshot_embed = torch.tensor(adata_embed.X)
 
     # TODO: invert from macrogene to gene space
     zeroshot_counts = None
 
     zeroshot_species = species
-    zeroshot_lab = adata_embed.obs["truth_labels"].values
+    zeroshot_lab = adata_embed.obs["labels2"].values
     zeroshot_ref = adata_embed.obs["ref_labels"].values
     all_obs_names = adata_embed.obs_names
 
@@ -252,7 +296,9 @@ def trainer(args):
         zeroshot_counts,
         zeroshot_lab,
         zeroshot_species,
+        species_guide,
         zeroshot_macrogenes.cpu().numpy(),
+        zeroshot_embed.cpu().numpy(),
         zeroshot_ref,
         obs_names=all_obs_names,
     )
