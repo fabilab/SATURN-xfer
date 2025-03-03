@@ -941,7 +941,7 @@ def inferrer(args):
     else:
         xfer_model.p_weights.requires_grad = True
     # Create the optimizer
-    # metric_lr is the learning rate for the metric model, which is the first encoder in the xfer model
+    # metric_lr is the learning rate for the metric model
     optimizer = optim.Adam(xfer_model.parameters(), lr=args.metric_lr)
 
     distance = distances.CosineSimilarity()
