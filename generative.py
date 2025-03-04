@@ -105,23 +105,26 @@ def train(
             gene_weights = model.p_weights.exp()
 
             # NOTE: the loss has three components:
-            # - the vae loss (ZINB adhaerence)
+            # - the reconstruction loss (ZINB adhaerence)
             # - a LASSO on the gene -> macrogene weights
             # - a rank loss on the gene -> macrogene weights
             # The last two are ok. The first one, let's take a look whether any change is needed given this is generated,
             # therefore there is no "library size" per se.
+            # Ok, the reconstruction loss is the log likelihood of the ZINB applied with organism-specific input counts
+            # and parameters estimated by the training. In normal SATURN, that means only the parameters are trained, whereas
+            # here also the backward weights can be trained.
             l = model.loss_vae(
                 data, None, None, 0, px_rates, px_rs, px_drops
             )  # This loss also works for non vae loss
-            spec_loss = l["loss"] / data.shape[0]
+            rec_loss = l["loss"] / data.shape[0]
             l1_loss = model.l1_penalty * model.lasso_loss(model.p_weights.exp())
             rank_loss = model.pe_sim_penalty * model.gene_weight_ranking_loss(
                 model.p_weights.exp(), embeddings_tensor
             )
 
-            batch_loss = spec_loss + l1_loss + rank_loss
+            batch_loss = rec_loss + l1_loss + rank_loss
 
-            epoch_ave_loss.append(float(spec_loss.detach().cpu()))
+            epoch_ave_loss.append(float(rec_loss.detach().cpu()))
 
             # TODO: why is there zero_grad here as well?
             optimizer.zero_grad()
