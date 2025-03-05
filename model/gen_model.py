@@ -53,7 +53,6 @@ class GenerativeModel(torch.nn.Module):
             nn.init.xavier_uniform_(
                 self.p_weights_rev, gain=nn.init.calculate_gain("relu")
             )
-        self.cl_layer_norm = nn.LayerNorm(self.num_cl)
 
         # Decoders
         self.px_decoder = nn.Sequential(
