@@ -32,9 +32,13 @@ class GenerativeModel(torch.nn.Module):
         random_weights=False,
         l1_penalty=0.1,
         pe_sim_penalty=1.0,
+        vae=False,
     ):
         """Generate synthetic cell gene expression vectors for new species."""
         super().__init__()
+
+        # TODO: unused for now
+        self.vae = vae
 
         self.dropout = dropout
         self.embed_dim = embed_dim
@@ -46,7 +50,9 @@ class GenerativeModel(torch.nn.Module):
         # Gene -> macrogene weights
         self.p_weights_rev = nn.Parameter(gene_scores.float().log())
         if random_weights:
-            nn.init.xavier_uniform_(self.p_weights, gain=nn.init.calculate_gain("relu"))
+            nn.init.xavier_uniform_(
+                self.p_weights_rev, gain=nn.init.calculate_gain("relu")
+            )
         self.cl_layer_norm = nn.LayerNorm(self.num_cl)
 
         # Decoders
@@ -97,18 +103,18 @@ class GenerativeModel(torch.nn.Module):
         # Input is in embedded space
         encoded = inp
 
-        #expr = inp
-        #expr = torch.log1p(expr)
-        #expr = expr.unsqueeze(1)
-        #clusters = []
-        #expr_and_genef = expr
-        #x = nn.functional.linear(expr_and_genef.squeeze(), self.p_weights.exp())
-        #x = self.cl_layer_norm(x)
-        #x = F.relu(x)
-        #x = F.dropout(x, self.dropout)
+        # expr = inp
+        # expr = torch.log1p(expr)
+        # expr = expr.unsqueeze(1)
+        # clusters = []
+        # expr_and_genef = expr
+        # x = nn.functional.linear(expr_and_genef.squeeze(), self.p_weights.exp())
+        # x = self.cl_layer_norm(x)
+        # x = F.relu(x)
+        # x = F.dropout(x, self.dropout)
 
-        #encoder_input = x.squeeze()
-        #encoded = self.encoder(encoder_input)
+        # encoder_input = x.squeeze()
+        # encoded = self.encoder(encoder_input)
 
         if encoded.dim() != 2:
             encoded = encoded.unsqueeze(0)
@@ -123,18 +129,13 @@ class GenerativeModel(torch.nn.Module):
         # Distribute the means by cluster, based on the current weights of gene_to_macrogene
         px_scale_decode = nn.Softmax(-1)(cl_to_px.squeeze())
 
-        # The rate of the ZINB is the sum of the genes, i.e. the library size
-        # FIXME: we do not have actual library sizes in this case
-        library = torch.log(inp.sum(1)).unsqueeze(1)
-        px_rate = torch.exp(library) * px_scale_decode
-
         # Dropout decoder for this one species, used to get the expected dropout rate in ZINB
         px_drop = self.px_dropout_decoder(decoded)
 
         # Species-specific theta used in ZINB
         px_r = torch.exp(self.px_r)
 
-        return encoded, px_rate, px_r, px_drop
+        return px_scale_decode, px_r, px_drop
 
     def get_reconstruction_loss(self, x, px_rate, px_r, px_dropout):
         """https://github.com/scverse/scvi-tools/blob/main/src/scvi/module/_vae.py

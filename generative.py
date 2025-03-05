@@ -13,9 +13,9 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "4"  # export VECLIB_MAXIMUM_THREADS=4
 os.environ["NUMEXPR_NUM_THREADS"] = "6"
 
 import os
+import anndata
 import scanpy as sc
 import pandas as pd
-from anndata import AnnData
 import warnings
 from builtins import int
 
@@ -34,7 +34,7 @@ from data.multi_species_data import (
     multi_species_collate_fn,
     ExperimentDatasetMultiEqualCT,
 )
-from data.multi_species_data import ExperimentDatasetMultiEqual
+from data.single_species_data import data_to_torch_X, ExperimentDatasetSingle
 
 from model.saturn_model import make_centroids, score_genes_against_centroids
 from model.gen_model import GenerativeModel
@@ -85,15 +85,25 @@ def train(
             # Obviously, each minibatch is used independently to speed up convergence
             optimizer.zero_grad()
 
-            (data, labels, refs, batch_labels) = batch_tuple
+            (data, library, labels, refs, batch_labels) = batch_tuple
 
             if data is None:
                 continue
 
-            data, labels, refs = data.to(device), labels.to(device), refs.to(device)
+            data, library, labels, refs = (
+                data.to(device),
+                library.to(device),
+                labels.to(device),
+                refs.to(device),
+            )
 
             # FIXME: this needs to change to something useful (backward)
-            encoder_input, encoded, px_rates, px_rs, px_drops = model(data, species)
+            px_scale_decode, px_rs, px_drops = model(data)
+
+            # The rate of the ZINB is the sum of the genes, i.e. the library size
+            # FIXME: we do not have actual library sizes in this case
+            library = torch.log(inp.sum(1)).unsqueeze(1)
+            px_rate = torch.exp(library) * px_scale_decode
 
             if px_rates.dim() != 2:
                 px_rates = px_rates.unsqueeze(0)
@@ -154,11 +164,12 @@ def create_output_anndata(
     use_batch_labels=False,
     train_batch=None,
     obs_names=None,
+    var_names=None,
 ):
     """
     Create an AnnData from the generative results
     """
-    adata = AnnData(train_counts)
+    adata = anndata.AnnData(train_counts)
     labels = train_lab
     adata.obs["labels"] = pd.Categorical(labels)
     adata.obs["labels2"] = pd.Categorical(
@@ -169,7 +180,7 @@ def create_output_anndata(
     adata.obs["ref_labels"] = pd.Categorical(ref_labels)
 
     adata.obs["species"] = train_species
-    adata.uns["guide_species"] = species_guide
+    adata.obs["guide_species"] = species_guide
 
     adata.obsm["macrogenes"] = train_macrogenes
     adata.obsm["embed"] = train_embed
@@ -178,6 +189,8 @@ def create_output_anndata(
         adata.obs["batch_labels"] = pd.Categorical(batch_labels)
     if obs_names is not None:
         adata.obs_names = obs_names
+    if var_names is not None:
+        adata.var_names = pd.Index(var_names, name="Gene")
     return adata
 
 
@@ -198,6 +211,19 @@ def trainer(args):
         adata_embed = adata_embed[adata_embed.obs["species"] == species_guide]
     else:
         species_guide = "all"
+
+    print("Load the original counts, to get library size")
+    species_embedded = adata_embed.obs["species"].cat.categories
+    data_df = pd.read_csv(args.in_data, index_col="species").loc[species_embedded]
+    # data_df should have columns for df location
+    species_to_path = data_df.to_dict()["path"]
+    adata_embed.obs["n_counts"] = -1
+    for spec in species_embedded:
+        tmp = anndata.read_h5ad(species_to_path[spec])
+        adata_embed.obs.loc[adata_embed.obs["species"] == spec, "n_counts"] = (
+            np.asarray(tmp.X.sum(axis=1)).ravel()
+        )
+        del tmp
 
     print("Load the protein embeddings for the new species")
     embedding_dict = load_gene_embeddings_one_species(
@@ -249,14 +275,12 @@ def trainer(args):
     )
     # Set frozen layers from the pretrained models
     gen_state_dict = gen_model.state_dict()
-    gen_state_dict["cl_layer_norm.weight"] = deepcopy(
-        pretrain_state_dict["cl_layer_norm.weight"]
-    )
-    gen_state_dict["cl_layer_norm.bias"] = deepcopy(
-        pretrain_state_dict["cl_layer_norm.bias"]
-    )
-    for key, val in encoder_state_dict.items():
-        if key.startswith("encoder"):
+    for key, val in pretrain_state_dict.items():
+        if (
+            key.startswith("px_encoder")
+            or key.startswith("cl_scale_decoder")
+            or key.startswith("p_weights_embeddings")
+        ):
             gen_state_dict[key] = deepcopy(val)
 
     # Reload state dict with pretrained initialisations
@@ -285,12 +309,16 @@ def trainer(args):
 
     print("***ZERO-SHOT GENERATION***")
     zeroshot_macrogenes = torch.tensor(adata_embed.obsm["macrogenes"])
-    zeroshot_embed = torch.tensor(adata_embed.X)
+    zeroshot_embed = data_to_torch_X(adata_embed.X).to(device)
 
     # TODO: invert from macrogene to gene space
-    zeroshot_counts = None
+    with torch.no_grad():
+        zeroshot_counts = gen_model(zeroshot_embed)[0]
+    zeroshot_counts *= (
+        torch.tensor(adata_embed.obs["n_counts"].values).to(device).unsqueeze(1)
+    )
+    zeroshot_counts = zeroshot_counts.cpu().numpy().astype(np.float32)
 
-    zeroshot_species = species
     zeroshot_lab = adata_embed.obs["labels2"].values
     zeroshot_ref = adata_embed.obs["ref_labels"].values
     all_obs_names = adata_embed.obs_names
@@ -298,16 +326,14 @@ def trainer(args):
     adata_zeroshot = create_output_anndata(
         zeroshot_counts,
         zeroshot_lab,
-        zeroshot_species,
+        species,
         species_guide,
         zeroshot_macrogenes.cpu().numpy(),
         zeroshot_embed.cpu().numpy(),
         zeroshot_ref,
         obs_names=all_obs_names,
+        var_names=all_gene_names,
     )
-    adata_zeroshot.obs["species"] = species
-    if species_guide is not None:
-        adata_zeroshot.uns["guide_species"] = species_guide
 
     if len(run_name) > 70:
         zeroshot_adata_fn = "zeroshot.h5ad"
@@ -322,38 +348,26 @@ def trainer(args):
 
     # Make the guide species data loader
     if use_batch_labels:  # we have a batch column to use for the pretrainer
-        train_dataset = ExperimentDatasetMultiEqual(
-            all_data=species_to_adata_xfer,
-            all_ys={
-                species: adata.obs["truth_labels"]
-                for (species, adata) in species_to_adata_xfer.items()
-            },
-            all_refs={
-                species: adata.obs["ref_labels"]
-                for (species, adata) in species_to_adata_xfer.items()
-            },
-            all_batch_labs={
-                species: adata.obs["batch_labels"]
-                for (species, adata) in species_to_adata_xfer.items()
-            },
+        train_dataset = ExperimentDatasetSingle(
+            data=adata_embed.X,
+            library=adata_embed.obs["n_counts"].values,
+            y=adata_embed.obs["labels2"].values,
+            ref=adata_embed.obs["ref_labels"].values,
+            batch=adata_embed.obs["batch_labels"].values,
         )
     else:
-        train_dataset = ExperimentDatasetMultiEqual(
-            all_data=species_to_adata_xfer,
-            all_ys={
-                species: adata.obs["truth_labels"]
-                for (species, adata) in species_to_adata_xfer.items()
-            },
-            all_refs={
-                species: adata.obs["ref_labels"]
-                for (species, adata) in species_to_adata_xfer.items()
-            },
-            all_batch_labs={},
+        train_dataset = ExperimentDatasetSingle(
+            data=adata_embed.X,
+            library=adata_embed.obs["n_counts"].values,
+            y=adata_embed.obs["labels2"].values,
+            ref=adata_embed.obs["ref_labels"].values,
+            batch=None,
         )
+
     # Load data with shuffling
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        collate_fn=multi_species_collate_fn,
+        collate_fn=single_species_collate_fn,
         batch_size=1024,
         shuffle=True,
     )
@@ -362,7 +376,7 @@ def trainer(args):
     # The species-specific parts should be obviously unfrozen
     for parameter in gen_model.parameters():
         parameter.requires_grad = False
-    gen_model.p_weights.requires_grad = True
+    gen_model.p_weights_rev.requires_grad = True
 
     # Create the optimizer
     # lr is the learning rate for the metric model
@@ -462,6 +476,12 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to embeddings summary pt file for the peptides of the species to infer",
+    )
+    parser.add_argument(
+        "--in_data",
+        type=str,
+        required=True,
+        help="Path to csv containing input datas and species",
     )
     parser.add_argument(
         "--species", type=str, help="Data to infer belongs to this species (optional)"
@@ -573,6 +593,7 @@ if __name__ == "__main__":
 
     # Defaults
     parser.set_defaults(
+        in_data=None,
         org=None,
         species="new",
         guide_species=None,
