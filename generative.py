@@ -34,7 +34,11 @@ from data.multi_species_data import (
     multi_species_collate_fn,
     ExperimentDatasetMultiEqualCT,
 )
-from data.single_species_data import data_to_torch_X, ExperimentDatasetSingle
+from data.single_species_data import (
+    data_to_torch_X,
+    ExperimentDatasetSingle,
+    single_species_collate_fn,
+)
 
 from model.saturn_model import make_centroids, score_genes_against_centroids
 from model.gen_model import GenerativeModel
@@ -356,14 +360,14 @@ def trainer(args):
     # Load data with shuffling
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        collate_fn=multi_species_collate_fn,
+        collate_fn=single_species_collate_fn,
         batch_size=1024,
         shuffle=True,
     )
 
     # TODO: freeze only the parameters that need no retraining (common encoders/decoders)
     # The species-specific parts should be obviously unfrozen
-    for layername in ["px_decoder", "cl_scale_decoder", "p_weights_embeddings"]
+    for layername in ["px_decoder", "cl_scale_decoder", "p_weights_embeddings"]:
         layer = getattr(gen_model, layername)
         for parameter in layer.parameters():
             parameter.requires_grad = False
@@ -561,6 +565,8 @@ if __name__ == "__main__":
         help="Train the transfer model instead of zero-shot inference.",
     )
     parser.add_argument("--epochs", type=int, help="How many epochs to train for")
+    parser.add_argument('--lr', type=float,
+                        help='Pre training Learning learning rate')    
 
     # Model paths
     parser.add_argument(
@@ -597,8 +603,7 @@ if __name__ == "__main__":
         hidden_dim=256,
         hv_genes=8000,
         epochs=50,
-        metric_lr=0.001,
-        pretrain_epochs=200,
+        lr=0.001,
         log_dir="tboard_log/",
         work_dir="./out/",
         time_stamp=False,
@@ -616,7 +621,7 @@ if __name__ == "__main__":
         hv_span=0.3,
         centroid_score_func="default",
         train=False,
-        encoder="metric",
+        encoder="pretrain",
     )
 
     args = parser.parse_args()

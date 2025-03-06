@@ -64,6 +64,7 @@ class ExperimentDatasetSingle(data.Dataset):
 
                 return (
                     self.x[idx],
+                    self.library[idx],
                     self.y[idx],
                     self.ref_labels[idx],
                     batch_ret,
@@ -79,3 +80,28 @@ class ExperimentDatasetSingle(data.Dataset):
 
     def get_dim(self) -> Dict[str, int]:
         return self.num_genes
+
+
+# NOTE: this is kind of awkward, ok for now
+def single_species_collate_fn(
+    batch: List[Tuple[torch.FloatTensor, torch.LongTensor, str]]
+) -> tuple:
+    has_batch_labels = False
+
+    # NOTE: this is like a fancy zipping with optional last column
+    res = [[], [], [], [], None]
+    for data, library, labels, refs, batch_labels in batch:
+        res[0].append(data)
+        res[1].append(library)
+        res[2].append(labels)
+        res[3].append(refs)
+
+        if batch_labels is not None:
+            has_batch_labels = True
+            if res[4] is None:
+                res[4] = []
+            res[4].append(batch_labels) 
+
+    res = tuple(torch.stack(x) if x is not None else None for x in res)
+
+    return res
