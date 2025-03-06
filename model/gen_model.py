@@ -26,9 +26,11 @@ class GenerativeModel(torch.nn.Module):
     def __init__(
         self,
         gene_scores,
+        species_order,
+        px_decoder_state_dict,
+        cl_scale_decoder_state_dict,
+        p_weights_embeddings_state_dict,
         dropout=0,
-        hidden_dim=128,
-        embed_dim=10,
         random_weights=False,
         l1_penalty=0.1,
         pe_sim_penalty=1.0,
@@ -40,9 +42,17 @@ class GenerativeModel(torch.nn.Module):
         # TODO: unused for now
         self.vae = vae
 
+        # The first layer of the decoder has the OH encoding of species (and, potentially, batch)
+        # even though the species OH encoding is not actually used ATM (see questionable comment
+        # in the original model).
+        sorted_species_names = sorted(species_order)
+        self.oh_encoding_species = {key: i for i, key in enumerate(sorted_species_names)}
+        self.num_species = len(sorted_species_names)
+        self.embed_dim = px_decoder_state_dict["0.0.weight"].shape[1] - self.num_species
+        self.hidden_dim = px_decoder_state_dict["0.0.weight"].shape[0]
+
         self.dropout = dropout
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim
+
         self.num_gene_scores = len(gene_scores)
         # num_cl is the number of macrogenes
         self.num_cl = gene_scores.shape[1]
@@ -56,9 +66,13 @@ class GenerativeModel(torch.nn.Module):
 
         # Decoders
         self.px_decoder = nn.Sequential(
-            full_block(self.embed_dim, self.hidden_dim, self.dropout),
+            full_block(self.embed_dim + self.num_species, self.hidden_dim, self.dropout),
         )
+        self.px_decoder.load_state_dict(px_decoder_state_dict)
+
         self.cl_scale_decoder = full_block(self.hidden_dim, self.num_cl)
+        self.cl_scale_decoder.load_state_dict(cl_scale_decoder_state_dict)
+
         self.px_dropout_decoder = nn.Sequential(
             nn.Linear(self.hidden_dim, self.num_gene_scores),
         )
@@ -78,8 +92,9 @@ class GenerativeModel(torch.nn.Module):
             )  # This embedding layer will be used in metric learning to encode
             # similarity in the protein embedding space
         )
+        self.p_weights_embeddings.load_state_dict(p_weights_embeddings_state_dict)
 
-    def forward(self, inp):
+    def forward(self, inp, species):
         """The actual layering of the model.
 
         Args:
@@ -97,28 +112,25 @@ class GenerativeModel(torch.nn.Module):
         construct macrogene -> gene weights onto NEW genes from an unseen species, and
         we have protein embeddings from those NEW genes.
         """
-        batch_size = inp.shape[0]
-
         # Input is in embedded space
         encoded = inp
 
-        # expr = inp
-        # expr = torch.log1p(expr)
-        # expr = expr.unsqueeze(1)
-        # clusters = []
-        # expr_and_genef = expr
-        # x = nn.functional.linear(expr_and_genef.squeeze(), self.p_weights.exp())
-        # x = self.cl_layer_norm(x)
-        # x = F.relu(x)
-        # x = F.dropout(x, self.dropout)
+        batch_size = inp.shape[0]
 
-        # encoder_input = x.squeeze()
-        # encoded = self.encoder(encoder_input)
+        # NOTE: this is 'as is' in the full SATURN model. The impression I get is that
+        # they never really implemented this and dumbed it to [1,0,..,0]. That's ok
+        # in practice, it just proves that you do not need OH encoding to decode the
+        # messages.
+        # One hot encode each species and paste it at the end of the embed_dim
+        spec_1h = torch.zeros(batch_size, self.num_species).to(inp.device)
+        # spec_idx = np.argmax(np.array(self.sorted_species_names) == species) # Fix for one hot
+        spec_idx = 0
+        spec_1h[:, spec_idx] = 1.0
 
         if encoded.dim() != 2:
             encoded = encoded.unsqueeze(0)
 
-        decoded = self.px_decoder(encoded)
+        decoded = self.px_decoder(torch.hstack((encoded, spec_1h)))
 
         cl_scale = self.cl_scale_decoder(decoded)
 

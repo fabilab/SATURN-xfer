@@ -209,9 +209,16 @@ def trainer(args):
     else:
         species_guide = "all"
 
+    print("Create mapping from cell type to integers, used in the data loader")
+    unique_cell_types = adata_embed.obs["labels2"].cat.categories
+    unique_ref_cell_types = adata_embed.obs["ref_labels"].cat.categories
+    adata_embed.obs["labels2_codes"] = adata_embed.obs["labels2"].cat.codes
+    adata_embed.obs["ref_labels_codes"] = adata_embed.obs["ref_labels"].cat.codes
+
     print("Load the original counts, to get library size")
     species_embedded = adata_embed.obs["species"].cat.categories
-    data_df = pd.read_csv(args.in_data, index_col="species").loc[species_embedded]
+    data_df = pd.read_csv(args.in_data, index_col="species")
+    species_training = list(data_df.index)
     # data_df should have columns for df location
     species_to_path = data_df.to_dict()["path"]
     adata_embed.obs["n_counts"] = -1
@@ -258,30 +265,22 @@ def trainer(args):
 
     print("***STARTING GENERATIVE LEARNING***")
     pretrain_state_dict = torch.load(args.pretrain_model_path)
-    # Copy the encoder parameters from either the pretrain or the metric model
-    if args.encoder == "pretrain":
-        encoder_state_dict = pretrain_state_dict
-    else:
-        encoder_state_dict = torch.load(args.metric_model_path)
+    key_prefixes = ["px_decoder", "cl_scale_decoder", "p_weights_embeddings"]
+    layer_state_dicts = {key+"_state_dict": {} for key in key_prefixes}
+    for key, value in pretrain_state_dict.items():
+        for prefix in key_prefixes:
+            if key.startswith(prefix):
+                key_noprefix = key[len(prefix)+1:]
+                layer_state_dicts[prefix+"_state_dict"][key_noprefix] = value
+                break
+    del pretrain_state_dict
 
     gen_model = GenerativeModel(
         gene_scores=centroid_weights,
+        species_order=species_training,
         dropout=0.1,
-        hidden_dim=encoder_state_dict["encoder.0.0.bias"].shape[0],
-        embed_dim=encoder_state_dict["encoder.1.1.bias"].shape[0],
+        **layer_state_dicts,
     )
-    # Set frozen layers from the pretrained models
-    gen_state_dict = gen_model.state_dict()
-    for key, val in pretrain_state_dict.items():
-        if (
-            key.startswith("px_encoder")
-            or key.startswith("cl_scale_decoder")
-            or key.startswith("p_weights_embeddings")
-        ):
-            gen_state_dict[key] = deepcopy(val)
-
-    # Reload state dict with pretrained initialisations
-    gen_model.load_state_dict(gen_state_dict)
 
     # Ship to GPU
     gen_model.to(device)
@@ -307,10 +306,12 @@ def trainer(args):
     print("***ZERO-SHOT GENERATION***")
     zeroshot_macrogenes = torch.tensor(adata_embed.obsm["macrogenes"])
     zeroshot_embed = data_to_torch_X(adata_embed.X).to(device)
+    zeroshot_species = adata_embed.obs["species"].values
+
 
     # TODO: invert from macrogene to gene space
     with torch.no_grad():
-        zeroshot_counts = gen_model(zeroshot_embed)[0]
+        zeroshot_counts = gen_model(zeroshot_embed, zeroshot_species)[0]
     zeroshot_counts *= (
         torch.tensor(adata_embed.obs["n_counts"].values).to(device).unsqueeze(1)
     )
@@ -344,36 +345,28 @@ def trainer(args):
         return
 
     # Make the guide species data loader
-    if use_batch_labels:  # we have a batch column to use for the pretrainer
-        train_dataset = ExperimentDatasetSingle(
-            data=adata_embed.X,
-            library=adata_embed.obs["n_counts"].values,
-            y=adata_embed.obs["labels2"].values,
-            ref=adata_embed.obs["ref_labels"].values,
-            batch=adata_embed.obs["batch_labels"].values,
-        )
-    else:
-        train_dataset = ExperimentDatasetSingle(
-            data=adata_embed.X,
-            library=adata_embed.obs["n_counts"].values,
-            y=adata_embed.obs["labels2"].values,
-            ref=adata_embed.obs["ref_labels"].values,
-            batch=None,
-        )
+    train_dataset = ExperimentDatasetSingle(
+        data=adata_embed.X,
+        library=adata_embed.obs["n_counts"].values,
+        y=adata_embed.obs["labels2_codes"].values,
+        ref=adata_embed.obs["ref_labels_codes"].values,
+        batch_lab=None,
+    )
 
     # Load data with shuffling
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        collate_fn=single_species_collate_fn,
+        collate_fn=multi_species_collate_fn,
         batch_size=1024,
         shuffle=True,
     )
 
     # TODO: freeze only the parameters that need no retraining (common encoders/decoders)
     # The species-specific parts should be obviously unfrozen
-    for parameter in gen_model.parameters():
-        parameter.requires_grad = False
-    gen_model.p_weights_rev.requires_grad = True
+    for layername in ["px_decoder", "cl_scale_decoder", "p_weights_embeddings"]
+        layer = getattr(gen_model, layername)
+        for parameter in layer.parameters():
+            parameter.requires_grad = False
 
     # Create the optimizer
     # lr is the learning rate for the metric model
