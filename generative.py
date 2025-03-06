@@ -97,13 +97,11 @@ def train(
                 refs.to(device),
             )
 
-            # FIXME: this needs to change to something useful (backward)
+            # Actually run the model
             px_scale_decode, px_rs, px_drops = model(data)
 
             # The rate of the ZINB is the sum of the genes, i.e. the library size
-            # FIXME: we do not have actual library sizes in this case
-            library = torch.log(inp.sum(1)).unsqueeze(1)
-            px_rate = torch.exp(library) * px_scale_decode
+            px_rate = library * px_scale_decode
 
             if px_rates.dim() != 2:
                 px_rates = px_rates.unsqueeze(0)
@@ -112,7 +110,6 @@ def train(
             if px_drops.dim() != 2:
                 px_drops = px_drops.unsqueeze(0)
 
-            gene_weights = model.p_weights.exp()
 
             # NOTE: the loss has three components:
             # - the reconstruction loss (ZINB adhaerence)
@@ -124,12 +121,12 @@ def train(
             # and parameters estimated by the training. In normal SATURN, that means only the parameters are trained, whereas
             # here also the backward weights can be trained.
             l = model.loss_vae(
-                data, None, None, 0, px_rates, px_rs, px_drops
+                data, None, None, 0, px_rate, px_rs, px_drops
             )  # This loss also works for non vae loss
             rec_loss = l["loss"] / data.shape[0]
-            l1_loss = model.l1_penalty * model.lasso_loss(model.p_weights.exp())
+            l1_loss = model.l1_penalty * model.lasso_loss(model.p_weight_revs.exp())
             rank_loss = model.pe_sim_penalty * model.gene_weight_ranking_loss(
-                model.p_weights.exp(), embeddings_tensor
+                model.p_weights_rev.exp(), embeddings_tensor
             )
 
             batch_loss = rec_loss + l1_loss + rank_loss
