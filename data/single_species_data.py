@@ -29,16 +29,10 @@ class ExperimentDatasetSingle(data.Dataset):
         library: Union[torch.Tensor, np.ndarray],
         y: Union[torch.Tensor, np.ndarray],
         ref: Union[torch.Tensor, np.ndarray],
+        species: Union[torch.Tensor, np.ndarray],
         batch_lab: Union[None, torch.Tensor, np.ndarray],
     ) -> None:
         super().__init__()
-        self.x = None
-        self.y = None
-        self.library = None
-        self.num_cells = None
-        self.num_genes = None
-        self.ref_labels = None
-        self.batch_labels = None
 
         X = data_to_torch_X(data)
         num_cells, num_genes = X.shape
@@ -49,10 +43,13 @@ class ExperimentDatasetSingle(data.Dataset):
         self.library = torch.LongTensor(library)
         self.y = torch.LongTensor(y)
         self.ref_labels = torch.LongTensor(ref)
+        self.species = torch.LongTensor(species)
         if (
             batch_lab is not None
         ):  # if we have an additional batch column like for tissue
             self.batch_labels = torch.LongTensor(batch_lab)
+        else:
+            self.batch_labels = None
 
     def __getitem__(self, idx):
         if isinstance(idx, int):
@@ -67,6 +64,7 @@ class ExperimentDatasetSingle(data.Dataset):
                     self.library[idx],
                     self.y[idx],
                     self.ref_labels[idx],
+                    self.species[idx],
                     batch_ret,
                 )
             else:
@@ -78,7 +76,7 @@ class ExperimentDatasetSingle(data.Dataset):
     def __len__(self) -> int:
         return self.num_cells
 
-    def get_dim(self) -> Dict[str, int]:
+    def get_dim(self) -> int:
         return self.num_genes
 
 
@@ -89,18 +87,19 @@ def single_species_collate_fn(
     has_batch_labels = False
 
     # NOTE: this is like a fancy zipping with optional last column
-    res = [[], [], [], [], None]
-    for data, library, labels, refs, batch_labels in batch:
+    res = [[], [], [], [], [], None]
+    for data, library, labels, refs, species, batch_labels in batch:
         res[0].append(data)
         res[1].append(library)
         res[2].append(labels)
         res[3].append(refs)
+        res[4].append(species)
 
         if batch_labels is not None:
             has_batch_labels = True
-            if res[4] is None:
-                res[4] = []
-            res[4].append(batch_labels) 
+            if res[5] is None:
+                res[5] = []
+            res[5].append(batch_labels) 
 
     res = tuple(torch.stack(x) if x is not None else None for x in res)
 

@@ -77,6 +77,8 @@ def train(
     """
 
     print("Train new macrogene weights...")
+    embeddings_tensor = embeddings_tensor.to(device)
+
     model.train()
 
     pbar = tqdm(np.arange(1, nepochs + 1))
@@ -89,23 +91,24 @@ def train(
             # Obviously, each minibatch is used independently to speed up convergence
             optimizer.zero_grad()
 
-            (data, library, labels, refs, batch_labels) = batch_tuple
+            (data, library, labels, refs, specs, batch_labels) = batch_tuple
 
             if data is None:
                 continue
 
-            data, library, labels, refs = (
+            data, library, labels, refs, specs = (
                 data.to(device),
                 library.to(device),
                 labels.to(device),
                 refs.to(device),
+                specs.to(device),
             )
 
             # Actually run the model
-            px_scale_decode, px_rs, px_drops = model(data)
+            px_scale_decode, px_rs, px_drops = model(data, specs)
 
             # The rate of the ZINB is the sum of the genes, i.e. the library size
-            px_rate = library * px_scale_decode
+            px_rates = px_scale_decode * library.unsqueeze(1)
 
             if px_rates.dim() != 2:
                 px_rates = px_rates.unsqueeze(0)
@@ -113,7 +116,6 @@ def train(
                 px_rs = px_rs.unsqueeze(0)
             if px_drops.dim() != 2:
                 px_drops = px_drops.unsqueeze(0)
-
 
             # NOTE: the loss has three components:
             # - the reconstruction loss (ZINB adhaerence)
@@ -124,11 +126,13 @@ def train(
             # Ok, the reconstruction loss is the log likelihood of the ZINB applied with organism-specific input counts
             # and parameters estimated by the training. In normal SATURN, that means only the parameters are trained, whereas
             # here also the backward weights can be trained.
+            # FIXME: hmm does not look too good does it
             l = model.loss_vae(
-                data, None, None, 0, px_rate, px_rs, px_drops
+                px_rates, None, None, 0, px_rates, px_rs, px_drops
             )  # This loss also works for non vae loss
+
             rec_loss = l["loss"] / data.shape[0]
-            l1_loss = model.l1_penalty * model.lasso_loss(model.p_weight_revs.exp())
+            l1_loss = model.l1_penalty * model.lasso_loss(model.p_weights_rev.exp())
             rank_loss = model.pe_sim_penalty * model.gene_weight_ranking_loss(
                 model.p_weights_rev.exp(), embeddings_tensor
             )
@@ -151,17 +155,18 @@ def train(
         pbar.set_description(loss_string)
         all_ave_loss.append(np.mean(epoch_ave_loss))
 
-        return model
+    return model
 
 
 def create_output_anndata(
     train_counts,
     train_lab,
+    species,
     train_species,
-    species_guide,
     train_macrogenes,
     train_embed,
     train_ref,
+    train_ncounts,
     use_batch_labels=False,
     train_batch=None,
     obs_names=None,
@@ -180,8 +185,9 @@ def create_output_anndata(
     ref_labels = train_ref
     adata.obs["ref_labels"] = pd.Categorical(ref_labels)
 
-    adata.obs["species"] = train_species
-    adata.obs["guide_species"] = species_guide
+    adata.obs["species"] = species
+    adata.obs["guide_species"] = train_species
+    adata.obs["guide_n_counts"] = train_ncounts
 
     adata.obsm["macrogenes"] = train_macrogenes
     adata.obsm["embed"] = train_embed
@@ -202,21 +208,22 @@ def trainer(args):
     device = torch.device(args.device)
     species = args.species
     embedding_path = args.in_embeddings_path
+    use_batch_labels = False
 
     print("Load the macrogene expression data, embedded by the autoencoder")
     adata_embed = sc.read(args.in_adata_path)
     print("Loaded macrogene expression data")
 
     if args.guide_species is not None:
-        species_guide = args.guide_species
-        adata_embed = adata_embed[adata_embed.obs["species"] == species_guide]
-    else:
-        species_guide = "all"
+        print(f"Restrict to guide species: {args.guide_species}")
+        adata_embed = adata_embed[adata_embed.obs["species"] == args.guide_species]
 
-    print("Create mapping from cell type to integers, used in the data loader")
+    print("Create mapping from obs columns to integers, used in the data loader")
+    unique_species = adata_embed.obs["species"].cat.categories
+    adata_embed.obs["species_codes"] = adata_embed.obs["species"].cat.codes
     unique_cell_types = adata_embed.obs["labels2"].cat.categories
-    unique_ref_cell_types = adata_embed.obs["ref_labels"].cat.categories
     adata_embed.obs["labels2_codes"] = adata_embed.obs["labels2"].cat.codes
+    unique_ref_cell_types = adata_embed.obs["ref_labels"].cat.categories
     adata_embed.obs["ref_labels_codes"] = adata_embed.obs["ref_labels"].cat.codes
 
     print("Load the original counts, to get library size")
@@ -244,8 +251,6 @@ def trainer(args):
     # stacked embeddings
     X = torch.stack([embedding_dict[gene_symbol] for gene_symbol in all_gene_names])
     print("Loaded protein embeddings")
-
-    # NOTE: there is no such thing as HVG strictu sensu. We can do HVG after we get the first pass at generating a synthetic atlas
 
     print("Load the centroids")
     with open(args.centroids_init_path, "rb") as f:
@@ -308,31 +313,30 @@ def trainer(args):
     run_name = args.dir_.split(args.log_dir)[-1]
 
     print("***ZERO-SHOT GENERATION***")
-    zeroshot_macrogenes = torch.tensor(adata_embed.obsm["macrogenes"])
-    zeroshot_embed = data_to_torch_X(adata_embed.X).to(device)
-    zeroshot_species = adata_embed.obs["species"].values
+    output_macrogenes = torch.tensor(adata_embed.obsm["macrogenes"])
+    output_embed = data_to_torch_X(adata_embed.X).to(device)
+    output_species = adata_embed.obs["species_codes"].values
+    output_lab = adata_embed.obs["labels2"].values
+    output_ref = adata_embed.obs["ref_labels"].values
+    output_counts = adata_embed.obs["n_counts"].values
+    all_obs_names = adata_embed.obs_names
 
-
-    # TODO: invert from macrogene to gene space
     with torch.no_grad():
-        zeroshot_counts = gen_model(zeroshot_embed, zeroshot_species)[0]
+        zeroshot_counts = gen_model(output_embed, output_species)[0]
     zeroshot_counts *= (
-        torch.tensor(adata_embed.obs["n_counts"].values).to(device).unsqueeze(1)
+        torch.tensor(output_counts).to(device).unsqueeze(1)
     )
     zeroshot_counts = zeroshot_counts.cpu().numpy().astype(np.float32)
 
-    zeroshot_lab = adata_embed.obs["labels2"].values
-    zeroshot_ref = adata_embed.obs["ref_labels"].values
-    all_obs_names = adata_embed.obs_names
-
     adata_zeroshot = create_output_anndata(
         zeroshot_counts,
-        zeroshot_lab,
+        output_lab,
         species,
-        species_guide,
-        zeroshot_macrogenes.cpu().numpy(),
-        zeroshot_embed.cpu().numpy(),
-        zeroshot_ref,
+        output_species,
+        output_macrogenes.cpu().numpy(),
+        output_embed.cpu().numpy(),
+        output_ref,
+        output_counts,
         obs_names=all_obs_names,
         var_names=all_gene_names,
     )
@@ -348,12 +352,31 @@ def trainer(args):
     if not args.train:
         return
 
+    print("Find highly variable genes in the zeroshot prediction")
+    sc.pp.highly_variable_genes(adata_zeroshot, flavor='seurat_v3', n_top_genes=args.hv_genes)  # Expects Count Data
+    hv_index = adata_zeroshot.var["highly_variable"].values.nonzero()[0]
+    hvgs = adata_zeroshot.var_names[hv_index]
+    centroid_weights_hvg = centroid_weights[hv_index]
+    X_hvg = X[hv_index]
+
+    print("Instantiate a smaller model limited to the HVGs")
+    gen_model = GenerativeModel(
+        gene_scores=centroid_weights_hvg,
+        species_order=species_training,
+        dropout=0.1,
+        **layer_state_dicts,
+    )
+
+    # Ship to GPU
+    gen_model.to(device)
+
     # Make the guide species data loader
     train_dataset = ExperimentDatasetSingle(
         data=adata_embed.X,
         library=adata_embed.obs["n_counts"].values,
         y=adata_embed.obs["labels2_codes"].values,
         ref=adata_embed.obs["ref_labels_codes"].values,
+        species=adata_embed.obs["species_codes"].values,
         batch_lab=None,
     )
 
@@ -380,14 +403,13 @@ def trainer(args):
     reducer = reducers.ThresholdReducer(low=0)
 
     print("***STARTING FINE-TUNING***")
-    # TODO: do something about estimating HVGs in the new species
     train(
         gen_model,
         train_loader,
         optimizer,
         device,
         args.epochs,
-        embeddings_tensor=X,
+        embeddings_tensor=X_hvg,
     )
 
     if args.gen_model_path is not None:
@@ -396,50 +418,25 @@ def trainer(args):
         torch.save(gen_model.state_dict(), args.gen_model_path)
 
     print("***FINE-TUNED INFERENCE***")
-    if use_batch_labels:
-        (
-            train_emb,
-            train_lab,
-            train_species,
-            train_macrogenes,
-            train_ref,
-            train_batch,
-        ) = get_all_embeddings(
-            gen_dataset,
-            gen_model,
-            device,
-            use_batch_labels,
-        )
-        adata_finetuned = create_output_anndata(
-            train_emb,
-            train_lab,
-            train_species,
-            train_macrogenes.cpu().numpy(),
-            train_ref,
-            use_batch_labels,
-            train_batch,
-            obs_names=all_obs_names,
-        )
-    else:
-        train_emb, train_lab, train_species, train_macrogenes, train_ref = (
-            get_all_embeddings(
-                gen_dataset,
-                gen_model,
-                device,
-                use_batch_labels,
-            )
-        )
-        adata_finetuned = create_output_anndata(
-            train_emb,
-            train_lab,
-            train_species,
-            train_macrogenes.cpu().numpy(),
-            train_ref,
-            obs_names=all_obs_names,
-        )
-    adata_finetuned.obs["species"] = args.species
-    if species_guide is not None:
-        adata_finetuned.uns["guide_species"] = species_guide
+    with torch.no_grad():
+        finetuned_counts = gen_model(output_embed, output_species)[0]
+    finetuned_counts *= (
+        torch.tensor(output_counts).to(device).unsqueeze(1)
+    )
+    finetuned_counts = finetuned_counts.cpu().numpy().astype(np.float32)
+
+    adata_finetuned = create_output_anndata(
+        finetuned_counts,
+        output_lab,
+        species,
+        output_species,
+        output_macrogenes.cpu().numpy(),
+        output_embed.cpu().numpy(),
+        output_ref,
+        output_counts,
+        obs_names=all_obs_names,
+        var_names=hvgs,
+    )
     adata_finetuned.uns["gen_training_epoch"] = args.epochs
 
     if len(run_name) > 70:
@@ -595,7 +592,6 @@ if __name__ == "__main__":
         guide_species=None,
         in_label_col=None,
         ref_label_col="CL_class_coarse",
-        non_species_batch_col=None,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         device_num=0,
         batch_size=4096,

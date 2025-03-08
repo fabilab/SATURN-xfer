@@ -94,7 +94,7 @@ class GenerativeModel(torch.nn.Module):
         )
         self.p_weights_embeddings.load_state_dict(p_weights_embeddings_state_dict)
 
-    def forward(self, inp, species):
+    def forward(self, inp, species_idx):
         """The actual layering of the model.
 
         Args:
@@ -123,8 +123,7 @@ class GenerativeModel(torch.nn.Module):
         # messages.
         # One hot encode each species and paste it at the end of the embed_dim
         spec_1h = torch.zeros(batch_size, self.num_species).to(inp.device)
-        # spec_idx = np.argmax(np.array(self.sorted_species_names) == species) # Fix for one hot
-        spec_idx = 0
+        spec_idx = 0  # FIXME: this literally like this in the original model...
         spec_1h[:, spec_idx] = 1.0
 
         if encoded.dim() != 2:
@@ -192,13 +191,14 @@ class GenerativeModel(torch.nn.Module):
         loss = torch.nn.L1Loss(reduction="sum")
         return loss(weights, torch.zeros_like(weights))
 
-    def gene_weight_ranking_loss(self, weights, embeddings):
+    def gene_weight_ranking_loss(self, weights_rev, embeddings):
         """Ranking loss used to regularize the gene to macrogene weights"""
+
         # weights is M x G, the gene -> macrogene weights
         # p_weights_embeddings is M x 256, macrogenes to a standardised latent space
         # x1 is G x 256, genes to a standardised latent space
         # This way we can compute similarity between gene/protein embeddings in a latent space
-        x1 = self.p_weights_embeddings(weights.t())
+        x1 = self.p_weights_embeddings(weights_rev)
 
         # Mean squared error loss
         loss = nn.MSELoss(reduction="sum")
