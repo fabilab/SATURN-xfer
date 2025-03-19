@@ -44,9 +44,8 @@ class ExperimentDatasetSingle(data.Dataset):
         self.y = torch.LongTensor(y)
         self.ref_labels = torch.LongTensor(ref)
         self.species = torch.LongTensor(species)
-        if (
-            batch_lab is not None
-        ):  # if we have an additional batch column like for tissue
+        # if we have an additional batch column like for tissue
+        if batch_lab is not None:
             self.batch_labels = torch.LongTensor(batch_lab)
         else:
             self.batch_labels = None

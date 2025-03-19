@@ -5,7 +5,7 @@ Created on Nov 7, 2022
 """
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch.utils.data as data
 import torch
@@ -23,7 +23,11 @@ def data_to_torch_X(X):
 
 class ExperimentDatasetMulti(data.Dataset):
     def __init__(
-        self, all_data: dict, all_ys: dict, all_refs: dict, all_batch_labs: dict
+        self,
+        all_data: dict,
+        all_ys: dict,
+        all_refs: dict,
+        all_batch_labs: dict
     ) -> None:
         super(ExperimentDatasetMulti, self).__init__()
         self.xs = {}
@@ -87,7 +91,11 @@ class ExperimentDatasetMulti(data.Dataset):
 
 class ExperimentDatasetMultiEqual(data.Dataset):
     def __init__(
-        self, all_data: dict, all_ys: dict, all_refs: dict, all_batch_labs: dict
+        self,
+        all_data: dict,
+        all_ys: dict,
+        all_refs: dict,
+        all_batch_labs: dict
     ) -> None:
         super(ExperimentDatasetMultiEqual, self).__init__()
         self.xs = {}
@@ -114,9 +122,9 @@ class ExperimentDatasetMultiEqual(data.Dataset):
         for species, ref in all_refs.items():
             r = torch.LongTensor(ref)
             self.ref_labels[species] = r
-        if (
-            len(all_batch_labs) != 0
-        ):  # if we have an additional batch column like for tissue
+
+        # if we have an additional batch column like for tissue
+        if len(all_batch_labs) != 0:
             for species, tissue in all_batch_labs.items():
                 t = torch.LongTensor(tissue)
                 self.batch_labels[species] = t
