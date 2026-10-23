@@ -831,7 +831,7 @@ def inferrer(args):
     # NOTE: The key thing is that to make the triplet loss meaningful, at least unidirectionally,
     # we must run the metric (xfer) training with at least two species (the guide species is the
     # obvious candidate AND also shuffle to ensure both species are found in EACH batch. For now
-    # we just use autobatching as the rest of SATURN but we'll have to fix both anyway
+    # we just use autobatching as the rest of SATURN, which seems sufficient in practice.
     if args.trained_adata_path is None:
         raise ValueError(
             "Must provide a trained adata path for training the transfer model."
