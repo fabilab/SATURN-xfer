@@ -66,6 +66,17 @@ This can be used for pretraining, metric training, or both in series. The latter
 ### SATURN-xfer
 To use SATURN-xfer, run the following Python script from an environment that has the dependencies and drivers installed:
 
+- `saturn-xfer.py`
+
+To run SATURN-xfer, you usually want to XXX (TODO TODO)
+
+SATURN-xfer can run in either one of two modes: zeroshot and fine-tuning:
+
+- **zeroshot** is faster because it does not require any additional training: it loads the new species data, guesses the relationships of its PLM embeddings onto the autoencoder, and runs inference with all weights frozen.
+- **fine-tuning** is more accurate because it loads the new species data, guesses the relationships of its PLM embeddings onto the autoencoder, then runs a training schedule aimed at improving the harmonisation of the new species with the rest of the model, and finally runs inference.
+
+Both modes are much, much faster than retraining SATURN from scratch. In general, we recommend fine tuning since the few additional minutes needed for this task are rarely a bottleneck in a research project. However, if you are doing exotic things like running hundreds of SATURN-xfer instances for large scale predictions, benchmarking, etc. you might want to check out the zeroshot mode. Zeroshot SATURN-xfer is also conceptually quite close to SATURN-gen, so it has some educational value if you are trying to learn how these models operate.
+
 
 Please refer to the paper or the [original repo](https://github.com/snap-stanford/saturn) for more details. The original repo appears unmaintained since 2024.
 
