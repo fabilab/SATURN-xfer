@@ -11,17 +11,19 @@ This repository *also* contains a fork of the original SATURN code with a number
 - If you are trying to run SATURN, we recommend you use this repo since the original codebase has critical bugs that compromise its results. 
 
 ## Conceptual overview
-This repo hosts three model architectures: SATURN (with fixes), SATURN-xfer, and SATURN-gen.
+This repo hosts three model architectures: SATURN (with bugfixes), SATURN-xfer, and SATURN-gen.
 
 ### SATURN
-This is the original model published in [Nature Methods](https://www.nature.com/articles/s41592-024-02191-z) by Rosen et al. SATURN takes two types of input:
+This is the original model published in [Nature Methods](https://www.nature.com/articles/s41592-024-02191-z) by Rosen et al. It takes two types of input:
 - Single cell transcriptomic data from multiple species (one h5ad file per species). Cell metadata must include a column describing cell type labels, which are used for training. They need to be strings. It is allowed to use uninterpretable labels such as "cluster_0", "cluster_1", etc. although doing so is likely to make downstream analysis more challenging.
 - Embeddings of protein sequences from multiple species through a protein language model (PLM). This is traditionally ESM1b, ESM2, ESMC (we tested all three), or similar models. The code assumes the embeddings are floating point numbers.
 
-The conceptual steps of SATURN are as follows:
-- Preprocess counts, labels, and protein embeddings: This prepares data structures for model training. Among other things, this includes a hard feature selection for each species (typically the top 1,000 or 2,000 overdispersed genes): not all genes are considered for each species.
-- Pretraining of the autoencoder: This adjusts all layers of the model so that counts from each species are reconstructed after passing through the latent space bottleneck. Data from multiple species are only very weakly harmonised after this step.
-- "Metric" training: This does the heavy lifting of the harmonisation across species. It does so by pulling together cells, in latent space, that respect cell type annotation after certain triangulations between pairs of species. Data from multiple species are fully harmonised after this step, with "sibling" cell types ideally fully overlapping.
+The three conceptual steps are as follows:
+1. Preprocess counts, labels, and protein embeddings: This prepares data structures for model training. Among other things, this includes a hard feature selection for each species (typically the top 1,000 or 2,000 overdispersed genes): not all genes are considered for each species.
+2. Pretraining of the autoencoder: This adjusts all layers of the model so that counts from each species are reconstructed after passing through the latent space bottleneck. Data from multiple species are only very weakly harmonised after this step.
+3. "Metric" training: This does the heavy lifting of the harmonisation across species. It does so by pulling together cells, in latent space, that respect cell type annotation after certain triangulations between pairs of species. Data from multiple species are fully harmonised after this step, with "sibling" cell types ideally fully overlapping.
+
+SATURN stores model and inference on the training data after pretraining (step 2) as well as after metric training (step 3), so one can look at the results of both and compare if desired. In practice, the data before metric training is hardly usable, and the model before metric training is only useful for testing purposes, namely trying out many variations of the metric training schedule and figuring out the best one for a given purpose.
 
 **NOTE:** Because of the triplet loss used by SATURN, cellular granularity within annotated cell types might actually decrease *within* each species compared to the original data. The upside is that within each cell type, cells are harmonised *across* species. This is an intrinsic design choice of SATURN and not an accident of specific training runs.
 
@@ -63,22 +65,39 @@ To use SATURN, see the original repo for instructions. In a nutshell, you need t
 
 This can be used for pretraining, metric training, or both in series. The latter would be the most common usage case apart from testing.
 
+Please refer to the paper or the [original repo](https://github.com/snap-stanford/saturn) for more details. The original repo appears unmaintained since 2024, which is unfortunate but typical of most bioinformatics tools.
+
 ### SATURN-xfer
 To use SATURN-xfer, run the following Python script from an environment that has the dependencies and drivers installed:
 
 - `saturn-xfer.py`
 
-To run SATURN-xfer, you usually want to XXX (TODO TODO)
+The most notable command-line options for a transfer learning run are:
 
+- `--species`: Name of the new species, for convenience only. This does not affect the computations.
+- `--in_data_path`: Path to the h5ad file for the new species.
+- `--in_embeddings_path`: Path to the pt embedding summary file (from ESM etc.) for the new species. These must be in the same file as for a normal SATURN run.
+- `--training_csv_path`: Path to the csv file previously used to train the SATURN base model. This file contains itself paths to h5ad and pt files for each training species.
+- `--guide_species`: Name of the species used as a guide for the transfer learning. This species must be present in the csv file above.
+- `--pretrain_model_path`: Path to the SATURN model after pretraining. This contains the decoder layers used for transfer learning.
+- `--metric_model_path`: Path to the SATURN model after metric training. This contains the encoder layers used for transfer learning.
+- `--trained_adata_path`: Path to an h5ad file containing the **latent space** counts for the guide species after metric training. It is allowed for this file to contains more than the guide species, as data from all other species will be silently ignored. Typically, people would just run the initial SATURN training and then use the output h5ad in encoder space, containing all species, for all kinds of transfer learning downstream.
+- `--train`: If used, fine-tune the transfer learning model (see below). If unused, run zeroshot inference.
+
+#### Fine-tuning or not?
 SATURN-xfer can run in either one of two modes: zeroshot and fine-tuning:
 
 - **zeroshot** is faster because it does not require any additional training: it loads the new species data, guesses the relationships of its PLM embeddings onto the autoencoder, and runs inference with all weights frozen.
-- **fine-tuning** is more accurate because it loads the new species data, guesses the relationships of its PLM embeddings onto the autoencoder, then runs a training schedule aimed at improving the harmonisation of the new species with the rest of the model, and finally runs inference.
+- **fine-tuning** (triggered by the `--train` command-line flag) leads to more accurate results because it loads the new species data, guesses the relationships of its PLM embeddings onto the autoencoder, runs a training schedule aimed at improving the harmonisation of the new species with the guide species, and finally runs inference.
 
 Both modes are much, much faster than retraining SATURN from scratch. In general, we recommend fine tuning since the few additional minutes needed for this task are rarely a bottleneck in a research project. However, if you are doing exotic things like running hundreds of SATURN-xfer instances for large scale predictions, benchmarking, etc. you might want to check out the zeroshot mode. Zeroshot SATURN-xfer is also conceptually quite close to SATURN-gen, so it has some educational value if you are trying to learn how these models operate.
 
+### SATURN-gen
+To use SATURN-gen, run the following Python script from an environment that has the dependencies and drivers installed:
 
-Please refer to the paper or the [original repo](https://github.com/snap-stanford/saturn) for more details. The original repo appears unmaintained since 2024.
+- `saturn-gen.py`
+
+The most notable command-line options for a generative learning run are:
 
 
 PyTorch implementation of [SATURN](https://www.biorxiv.org/content/10.1101/2023.02.03.526939v1), a deep learning approach that couples gene expression with protein representations learnt using large protein language models for cross-species integration. The key idea in SATURN is to map cells from all datasets to a shared space of functionally related genes that we name macrogenes. Using macrogenes, SATURN is uniquely able to detect functionally related genes co-expressed across species.
