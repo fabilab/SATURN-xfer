@@ -1055,7 +1055,7 @@ def inferrer(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Set model hyperparametrs.",
+        description="SATURN-xfer: transfer learning with trained SATURN models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 

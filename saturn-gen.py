@@ -211,7 +211,7 @@ def trainer(args):
     use_batch_labels = False
 
     print("Load the macrogene expression data, embedded by the autoencoder")
-    adata_embed = sc.read(args.in_adata_path)
+    adata_embed = sc.read(args.trained_adata_path)
     print("Loaded macrogene expression data")
 
     if args.guide_species is not None:
@@ -228,7 +228,7 @@ def trainer(args):
 
     print("Load the original counts, to get library size")
     species_embedded = adata_embed.obs["species"].cat.categories
-    data_df = pd.read_csv(args.in_data, index_col="species")
+    data_df = pd.read_csv(args.training_csv_path, index_col="species")
     species_training = list(data_df.index)
     # data_df should have columns for df location
     species_to_path = data_df.to_dict()["path"]
@@ -275,12 +275,12 @@ def trainer(args):
     print("***STARTING GENERATIVE LEARNING***")
     pretrain_state_dict = torch.load(args.pretrain_model_path)
     key_prefixes = ["px_decoder", "cl_scale_decoder", "p_weights_embeddings"]
-    layer_state_dicts = {key+"_state_dict": {} for key in key_prefixes}
+    layer_state_dicts = {key + "_state_dict": {} for key in key_prefixes}
     for key, value in pretrain_state_dict.items():
         for prefix in key_prefixes:
             if key.startswith(prefix):
-                key_noprefix = key[len(prefix)+1:]
-                layer_state_dicts[prefix+"_state_dict"][key_noprefix] = value
+                key_noprefix = key[len(prefix) + 1 :]
+                layer_state_dicts[prefix + "_state_dict"][key_noprefix] = value
                 break
     del pretrain_state_dict
 
@@ -323,9 +323,7 @@ def trainer(args):
 
     with torch.no_grad():
         zeroshot_counts = gen_model(output_embed, output_species)[0]
-    zeroshot_counts *= (
-        torch.tensor(output_counts).to(device).unsqueeze(1)
-    )
+    zeroshot_counts *= torch.tensor(output_counts).to(device).unsqueeze(1)
     zeroshot_counts = zeroshot_counts.cpu().numpy().astype(np.float32)
 
     adata_zeroshot = create_output_anndata(
@@ -353,7 +351,9 @@ def trainer(args):
         return
 
     print("Find highly variable genes in the zeroshot prediction")
-    sc.pp.highly_variable_genes(adata_zeroshot, flavor='seurat_v3', n_top_genes=args.hv_genes)  # Expects Count Data
+    sc.pp.highly_variable_genes(
+        adata_zeroshot, flavor="seurat_v3", n_top_genes=args.hv_genes
+    )  # Expects Count Data
     hv_index = adata_zeroshot.var["highly_variable"].values.nonzero()[0]
     hvgs = adata_zeroshot.var_names[hv_index]
     centroid_weights_hvg = centroid_weights[hv_index]
@@ -420,9 +420,7 @@ def trainer(args):
     print("***FINE-TUNED INFERENCE***")
     with torch.no_grad():
         finetuned_counts = gen_model(output_embed, output_species)[0]
-    finetuned_counts *= (
-        torch.tensor(output_counts).to(device).unsqueeze(1)
-    )
+    finetuned_counts *= torch.tensor(output_counts).to(device).unsqueeze(1)
     finetuned_counts = finetuned_counts.cpu().numpy().astype(np.float32)
 
     adata_finetuned = create_output_anndata(
@@ -449,7 +447,6 @@ def trainer(args):
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(
         description="Set model hyperparametrs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -457,7 +454,7 @@ if __name__ == "__main__":
 
     # Run Setup
     parser.add_argument(
-        "--in_adata_path",
+        "--trained_adata_path",
         type=str,
         required=True,
         help="Path to h5ad of the data in macrogene and embedding space, used to generate synthetic cell profiles.",
@@ -469,10 +466,10 @@ if __name__ == "__main__":
         help="Path to embeddings summary pt file for the peptides of the species to infer",
     )
     parser.add_argument(
-        "--in_data",
+        "--training_csv_path",
         type=str,
         required=True,
-        help="Path to csv containing input datas and species",
+        help="Path to csv containing training adata and embedding paths and species names",
     )
     parser.add_argument(
         "--species", type=str, help="Data to infer belongs to this species (optional)"
@@ -556,14 +553,8 @@ if __name__ == "__main__":
         choices=["pretrain", "metric"],
         help="Which encoder to use for the transfer model. Default is to use the final metric model.",
     )
-    parser.add_argument(
-        "--train",
-        action="store_true",
-        help="Train the transfer model instead of zero-shot inference.",
-    )
     parser.add_argument("--epochs", type=int, help="How many epochs to train for")
-    parser.add_argument('--lr', type=float,
-                        help='Pre training Learning learning rate')    
+    parser.add_argument("--lr", type=float, help="Pre training Learning learning rate")
 
     # Model paths
     parser.add_argument(
@@ -581,12 +572,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gen_model_path",
         type=str,
-        help="Path to store the transfer learning model to",
+        help="Path to store the final generative learning model to",
     )
 
     # Defaults
     parser.set_defaults(
-        in_data=None,
+        training_csv_path=None,
         org=None,
         species="new",
         guide_species=None,
